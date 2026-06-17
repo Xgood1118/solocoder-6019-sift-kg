@@ -1,0 +1,404 @@
+"""Library-usable pipeline functions.
+
+Each function corresponds to a CLI command but takes explicit parameters
+instead of reading from config/CLI args. Use these from Jupyter notebooks,
+web apps, or anywhere you want sift-kg as a library.
+"""
+
+import logging
+from pathlib import Path
+
+from sift_kg.domains.models import DomainConfig
+from sift_kg.extract.llm_client import LLMClient
+from sift_kg.extract.models import DocumentExtraction
+from sift_kg.graph.knowledge_graph import KnowledgeGraph
+from sift_kg.resolve.models import MergeFile, RelationReviewFile
+
+logger = logging.getLogger(__name__)
+
+
+def run_extract(
+    doc_dir: Path,
+    model: str,
+    domain: DomainConfig,
+    output_dir: Path,
+    max_cost: float | None = None,
+    concurrency: int = 4,
+    chunk_size: int = 10000,
+    force: bool = False,
+    extractor: str = "kreuzberg",
+    ocr: bool = False,
+    ocr_backend: str = "tesseract",
+    ocr_language: str = "eng",
+    rpm: int = 40,
+) -> list[DocumentExtraction]:
+    """Extract entities and relations from all documents in a directory.
+
+    Args:
+        doc_dir: Directory containing documents (PDF, text, HTML, 75+ formats)
+        model: LLM model string (e.g. "openai/gpt-4o-mini")
+        domain: Domain configuration
+        output_dir: Where to save extraction JSON files
+        max_cost: Budget cap in USD
+        concurrency: Concurrent LLM calls per document
+        chunk_size: Characters per text chunk (larger = fewer API calls)
+        force: Re-extract all documents, ignoring cached results
+        extractor: Extraction backend — "kreuzberg" (default) or "pdfplumber"
+        ocr: Enable OCR for scanned documents
+        ocr_backend: OCR engine — "tesseract", "easyocr", "paddleocr", or "gcv"
+        ocr_language: OCR language code (ISO 639-3, e.g. "eng")
+        rpm: Max requests per minute
+
+    Returns:
+        List of DocumentExtraction results
+    """
+    from sift_kg.extract.extractor import extract_all
+    from sift_kg.ingest.reader import discover_documents
+
+    docs = discover_documents(doc_dir, backend=extractor)
+    if not docs:
+        logger.warning(f"No supported documents found in {doc_dir}")
+        return []
+
+    llm = LLMClient(model=model, rpm=rpm)
+    return extract_all(
+        docs, llm, domain, output_dir,
+        max_cost=max_cost, concurrency=concurrency, chunk_size=chunk_size,
+        force=force, ocr=ocr, backend=extractor,
+        ocr_backend=ocr_backend, ocr_language=ocr_language,
+    )
+
+
+def run_build(
+    output_dir: Path,
+    domain: DomainConfig,
+    review_threshold: float = 0.7,
+    postprocess: bool = True,
+) -> KnowledgeGraph:
+    """Build knowledge graph from extraction results.
+
+    Also flags relations for review and saves the graph + review file.
+
+    Args:
+        output_dir: Directory with extraction JSON files
+        domain: Domain configuration (for review_required types)
+        review_threshold: Flag relations below this confidence
+        postprocess: Whether to remove redundant edges
+
+    Returns:
+        Populated KnowledgeGraph
+    """
+    from sift_kg.graph.builder import build_graph, flag_relations_for_review, load_extractions
+    from sift_kg.resolve.io import write_relation_review
+    from sift_kg.resolve.models import RelationReviewEntry
+
+    extractions = load_extractions(output_dir)
+    if not extractions:
+        raise FileNotFoundError(f"No extractions found in {output_dir / 'extractions'}")
+
+    # Use discovered domain for normalization when schema-free
+    effective_domain = domain
+    if domain.schema_free:
+        from sift_kg.domains.discovery import load_discovered_domain
+
+        discovered = load_discovered_domain(output_dir / "discovered_domain.yaml")
+        if discovered:
+            logger.info(f"Using discovered schema for build ({len(discovered.entity_types)} entity types)")
+            effective_domain = discovered
+
+    domain_rel_types = set(effective_domain.relation_types.keys()) if effective_domain.relation_types else None
+    domain_rel_configs = {
+        name: (cfg.source_types, cfg.target_types, cfg.symmetric)
+        for name, cfg in effective_domain.relation_types.items()
+    } if effective_domain.relation_types else None
+    domain_canonical = {
+        name: (cfg.canonical_names, cfg.canonical_fallback_type)
+        for name, cfg in effective_domain.entity_types.items()
+        if cfg.canonical_names
+    } or None
+    kg = build_graph(
+        extractions,
+        postprocess=postprocess,
+        domain_relation_types=domain_rel_types,
+        domain_relation_configs=domain_rel_configs,
+        domain_canonical_entities=domain_canonical,
+    )
+
+    # Save graph
+    graph_path = output_dir / "graph_data.json"
+    kg.save(graph_path)
+
+    # Detect communities (Louvain, no LLM needed)
+    from sift_kg.graph.communities import detect_communities, save_communities
+
+    communities = detect_communities(kg)
+    if communities:
+        save_communities(communities, output_dir)
+    else:
+        (output_dir / "communities.json").write_text("{}", encoding="utf-8")
+
+    # Flag relations for review
+    review_types = {
+        name for name, cfg in effective_domain.relation_types.items()
+        if cfg.review_required
+    }
+    flagged = flag_relations_for_review(kg, review_threshold, review_types)
+
+    if flagged:
+        entries = [RelationReviewEntry(**f) for f in flagged]
+        review_file = RelationReviewFile(
+            review_threshold=review_threshold, relations=entries
+        )
+        write_relation_review(review_file, output_dir / "relation_review.yaml")
+
+    return kg
+
+
+def run_resolve(
+    output_dir: Path,
+    model: str,
+    domain: DomainConfig | None = None,
+    use_embeddings: bool = False,
+    concurrency: int = 4,
+    rpm: int = 40,
+) -> MergeFile:
+    """Find duplicate entities using LLM-based resolution.
+
+    Args:
+        output_dir: Directory with graph_data.json
+        model: LLM model string
+        domain: Domain configuration (provides system context for smarter resolution)
+        use_embeddings: Use semantic clustering for batching (requires sift-kg[embeddings])
+        concurrency: Concurrent LLM calls
+        rpm: Max requests per minute
+
+    Returns:
+        MergeFile with DRAFT proposals
+    """
+    from sift_kg.resolve.io import write_proposals
+    from sift_kg.resolve.resolver import find_merge_candidates
+
+    graph_path = output_dir / "graph_data.json"
+    if not graph_path.exists():
+        raise FileNotFoundError(f"No graph found at {graph_path}")
+
+    kg = KnowledgeGraph.load(graph_path)
+    llm = LLMClient(model=model, rpm=rpm)
+    system_context = domain.system_context if domain else ""
+    merge_file, variant_relations = find_merge_candidates(
+        kg, llm, concurrency=concurrency,
+        use_embeddings=use_embeddings, system_context=system_context,
+    )
+
+    if merge_file.proposals:
+        write_proposals(merge_file, output_dir / "merge_proposals.yaml")
+
+    if variant_relations:
+        from sift_kg.resolve.io import read_relation_review, write_relation_review
+        from sift_kg.resolve.models import RelationReviewFile
+
+        review_path = output_dir / "relation_review.yaml"
+        if review_path.exists():
+            review_file = read_relation_review(review_path)
+        else:
+            review_file = RelationReviewFile()
+        review_file.relations.extend(variant_relations)
+        write_relation_review(review_file, review_path)
+
+    return merge_file
+
+
+def run_apply_merges(output_dir: Path) -> dict:
+    """Apply confirmed entity merges and relation rejections.
+
+    Args:
+        output_dir: Directory with graph_data.json and review files
+
+    Returns:
+        Stats dict with merges_applied, rejected_count
+    """
+    from sift_kg.resolve.engine import apply_merges, apply_relation_rejections
+    from sift_kg.resolve.io import read_proposals, read_relation_review
+
+    graph_path = output_dir / "graph_data.json"
+    if not graph_path.exists():
+        raise FileNotFoundError(f"No graph found at {graph_path}")
+
+    kg = KnowledgeGraph.load(graph_path)
+
+    merge_stats = {"merges_applied": 0}
+    proposals_path = output_dir / "merge_proposals.yaml"
+    if proposals_path.exists():
+        merge_file = read_proposals(proposals_path)
+        if merge_file.confirmed:
+            merge_stats = apply_merges(kg, merge_file)
+
+    rejected_count = 0
+    review_path = output_dir / "relation_review.yaml"
+    if review_path.exists():
+        review_file = read_relation_review(review_path)
+        rejected_count = apply_relation_rejections(kg, review_file)
+
+    if merge_stats.get("merges_applied", 0) or rejected_count:
+        kg.save(graph_path)
+
+    return {"merges_applied": merge_stats.get("merges_applied", 0), "rejected_count": rejected_count}
+
+
+def run_narrate(
+    output_dir: Path,
+    model: str,
+    system_context: str = "",
+    include_entity_descriptions: bool = True,
+    max_cost: float | None = None,
+    communities_only: bool = False,
+) -> Path:
+    """Generate narrative summary from the knowledge graph.
+
+    Args:
+        output_dir: Directory with graph_data.json
+        model: LLM model string
+        system_context: Optional domain context for LLM
+        include_entity_descriptions: Generate per-entity descriptions
+        max_cost: Budget cap in USD
+        communities_only: Only regenerate community labels (~$0.01)
+
+    Returns:
+        Path to generated narrative.md or communities.json
+    """
+    graph_path = output_dir / "graph_data.json"
+    if not graph_path.exists():
+        raise FileNotFoundError(f"No graph found at {graph_path}")
+
+    kg = KnowledgeGraph.load(graph_path)
+    llm = LLMClient(model=model)
+
+    if communities_only:
+        from sift_kg.narrate.generator import regenerate_communities
+        return regenerate_communities(kg=kg, llm=llm, output_dir=output_dir)
+
+    from sift_kg.narrate.generator import generate_narrative
+
+    return generate_narrative(
+        kg=kg,
+        llm=llm,
+        output_dir=output_dir,
+        system_context=system_context,
+        include_entity_descriptions=include_entity_descriptions,
+        max_cost=max_cost,
+    )
+
+
+def run_export(
+    output_dir: Path,
+    fmt: str = "json",
+    export_path: Path | None = None,
+) -> Path:
+    """Export the knowledge graph to a specified format.
+
+    Args:
+        output_dir: Directory with graph_data.json
+        fmt: Export format — "json", "graphml", "gexf", "csv", or "sqlite"
+        export_path: Where to write output (default: output_dir/graph.{fmt})
+
+    Returns:
+        Path to the exported file or directory
+    """
+    from sift_kg.export import export_graph
+
+    graph_path = output_dir / "graph_data.json"
+    if not graph_path.exists():
+        raise FileNotFoundError(f"No graph found at {graph_path}")
+
+    kg = KnowledgeGraph.load(graph_path)
+
+    if export_path is None:
+        if fmt == "csv":
+            export_path = output_dir / "csv"
+        else:
+            ext = {"json": "json", "graphml": "graphml", "gexf": "gexf", "sqlite": "sqlite"}[fmt]
+            export_path = output_dir / f"graph.{ext}"
+
+    return export_graph(kg, export_path, fmt)
+
+
+def run_view(
+    output_dir: Path,
+    to: Path | None = None,
+    open_browser: bool = True,
+    top_n: int | None = None,
+    min_confidence: float | None = None,
+    source_doc: str | None = None,
+    neighborhood: str | None = None,
+    depth: int = 1,
+    community: str | None = None,
+) -> Path:
+    """Generate interactive graph visualization with optional pre-filters.
+
+    Args:
+        output_dir: Directory with graph_data.json
+        to: Output HTML path (default: output_dir/graph.html)
+        open_browser: Whether to open in browser
+        top_n: Show only top N entities by degree
+        min_confidence: Hide nodes/edges below this confidence
+        source_doc: Show only entities from this document
+        neighborhood: Center on entity ID (e.g. 'person:alice')
+        depth: Neighborhood hops (used with neighborhood)
+        community: Focus on a specific community label
+
+    Returns:
+        Path to generated HTML file
+    """
+    from sift_kg.visualize import generate_view
+
+    graph_path = output_dir / "graph_data.json"
+    if not graph_path.exists():
+        raise FileNotFoundError(f"No graph found at {graph_path}")
+
+    kg = KnowledgeGraph.load(graph_path)
+    dest = to or output_dir / "graph.html"
+
+    desc_path = output_dir / "entity_descriptions.json"
+    return generate_view(
+        kg, dest, open_browser=open_browser,
+        descriptions_path=desc_path if desc_path.exists() else None,
+        top_n=top_n,
+        min_confidence=min_confidence,
+        source_doc=source_doc,
+        neighborhood=neighborhood,
+        depth=depth,
+        community=community,
+    )
+
+
+def run_pipeline(
+    doc_dir: Path,
+    model: str,
+    domain: DomainConfig,
+    output_dir: Path,
+    max_cost: float | None = None,
+    include_narrative: bool = True,
+) -> Path:
+    """Run the full pipeline: extract → build → narrate.
+
+    Skips resolve/apply-merges (those require human review).
+
+    Args:
+        doc_dir: Directory containing documents
+        model: LLM model string
+        domain: Domain configuration
+        output_dir: Output directory for all artifacts
+        max_cost: Budget cap in USD
+        include_narrative: Whether to generate narrative at the end
+
+    Returns:
+        Path to output directory
+    """
+    run_extract(doc_dir, model, domain, output_dir, max_cost=max_cost)
+    run_build(output_dir, domain)
+
+    if include_narrative:
+        system_context = domain.system_context or ""
+        run_narrate(output_dir, model, system_context=system_context, max_cost=max_cost)
+
+    return output_dir

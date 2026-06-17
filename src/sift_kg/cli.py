@@ -1,0 +1,1524 @@
+"""CLI interface for sift-kg."""
+
+import logging
+from pathlib import Path
+
+import click
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from sift_kg.config import SiftConfig
+
+app = typer.Typer(
+    name="sift",
+    help="Document-to-knowledge-graph pipeline",
+    add_completion=True,
+    rich_markup_mode="rich",
+)
+
+console = Console()
+
+
+def _load_domain(config: SiftConfig, domain_name: str = "schema-free"):
+    """Load domain config from user path or bundled name.
+
+    Priority: --domain CLI flag > SIFT_DOMAIN_PATH env > sift.yaml > bundled default
+
+    The domain value from sift.yaml can be a file path or a bundled name
+    (e.g. "academic", "osint"). If the path doesn't exist as a file, it's
+    tried as a bundled domain name.
+    """
+    from sift_kg.domains.loader import DomainLoader
+
+    loader = DomainLoader()
+    if config.domain_path:
+        if config.domain_path.exists():
+            return loader.load_from_path(config.domain_path)
+        # Try as a bundled domain name (e.g. domain: academic in sift.yaml)
+        name = str(config.domain_path)
+        if name in loader.list_bundled():
+            return loader.load_bundled(name)
+        return loader.load_from_path(config.domain_path)  # let it raise
+    return loader.load_bundled(domain_name)
+
+
+def _setup_logging(verbose: bool = False) -> None:
+    """Configure logging level."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(levelname)s: %(message)s",
+    )
+    # Suppress noisy libraries
+    logging.getLogger("litellm").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+# ============================================================================
+# Pipeline Commands
+# ============================================================================
+
+
+@app.command()
+def extract(
+    directory: str = typer.Argument(..., help="Directory containing documents to process"),
+    model: str = typer.Option(None, help="LLM model (e.g. openai/gpt-4o-mini)"),
+    domain: str | None = typer.Option(None, help="Path to custom domain YAML"),
+    domain_name: str = typer.Option(
+        "schema-free", "--domain-name", "-d", help="Bundled domain name (e.g. general, osint)"
+    ),
+    max_cost: float | None = typer.Option(None, help="Maximum cost budget in USD"),
+    chunk_size: int = typer.Option(
+        10000, "--chunk-size", help="Characters per chunk (larger = fewer API calls, lower cost)"
+    ),
+    concurrency: int = typer.Option(
+        4, "-c", "--concurrency", help="Concurrent LLM calls per document"
+    ),
+    rpm: int = typer.Option(
+        40, "--rpm", help="Max requests per minute (prevents rate limit waste)"
+    ),
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Re-extract all documents, ignoring cached results"
+    ),
+    use_ocr: bool = typer.Option(False, "--ocr", help="Enable OCR for scanned documents"),
+    extractor: str | None = typer.Option(
+        None,
+        "--extractor",
+        help="Extraction backend",
+        click_type=click.Choice(["kreuzberg", "pdfplumber"]),
+    ),
+    ocr_backend: str | None = typer.Option(
+        None,
+        "--ocr-backend",
+        help="OCR backend",
+        click_type=click.Choice(["tesseract", "easyocr", "paddleocr", "gcv"]),
+    ),
+    ocr_language: str | None = typer.Option(
+        None, "--ocr-language", help="OCR language code (ISO 639-3, e.g. eng, fra, deu)"
+    ),
+    output: str | None = typer.Option(None, "-o", help="Output directory"),
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Verbose logging"),
+) -> None:
+    """Extract entities and relations from documents."""
+    _setup_logging(verbose)
+    config = SiftConfig()
+    effective_model = model or config.default_model
+
+    try:
+        config.validate_api_keys(effective_model)
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1) from None
+
+    # Load domain
+    if domain:
+        config.domain_path = Path(domain)
+    domain_config = _load_domain(config, domain_name)
+
+    # Output dir
+    output_dir = Path(output) if output else config.output_dir
+
+    # Resolve effective extraction settings: CLI > config > defaults
+    effective_ocr = use_ocr or config.ocr
+    effective_backend = extractor or config.extraction_backend
+    effective_ocr_backend = ocr_backend or config.ocr_backend
+    effective_ocr_language = ocr_language or config.ocr_language
+
+    # Discover documents
+    from sift_kg.ingest.reader import discover_documents
+
+    doc_dir = Path(directory)
+    if not doc_dir.is_dir():
+        console.print(f"[red]Error:[/red] Not a directory: {directory}")
+        raise typer.Exit(1)
+
+    docs = discover_documents(doc_dir, backend=effective_backend)
+    if not docs:
+        console.print(f"[yellow]No supported documents found in {directory}[/yellow]")
+        raise typer.Exit(0)
+
+    domain_label = domain_config.name
+    if domain_config.schema_free:
+        domain_label += " [dim](schema-free)[/dim]"
+    console.print(f"[cyan]Domain:[/cyan] {domain_label}")
+    console.print(f"[cyan]Model:[/cyan] {effective_model}")
+    console.print(f"[cyan]Extractor:[/cyan] {effective_backend}")
+    console.print(f"[cyan]Documents:[/cyan] {len(docs)}")
+    if effective_ocr:
+        ocr_label = (
+            "Google Cloud Vision" if effective_ocr_backend == "gcv" else effective_ocr_backend
+        )
+        console.print(f"[cyan]OCR:[/cyan] enabled ({ocr_label})")
+    if max_cost:
+        console.print(f"[cyan]Budget:[/cyan] ${max_cost:.2f}")
+    console.print()
+
+    # Set up LLM client and run extraction
+    from sift_kg.extract.extractor import extract_all
+    from sift_kg.extract.llm_client import LLMClient
+
+    llm = LLMClient(model=effective_model, rpm=rpm)
+    results = extract_all(
+        docs,
+        llm,
+        domain_config,
+        output_dir,
+        max_cost=max_cost,
+        concurrency=concurrency,
+        chunk_size=chunk_size,
+        force=force,
+        ocr=effective_ocr,
+        backend=effective_backend,
+        ocr_backend=effective_ocr_backend,
+        ocr_language=effective_ocr_language,
+    )
+
+    # Show discovered schema info if present
+    discovered_path = output_dir / "discovered_domain.yaml"
+    if domain_config.schema_free and discovered_path.exists():
+        from sift_kg.domains.discovery import load_discovered_domain
+
+        discovered = load_discovered_domain(discovered_path)
+        if discovered:
+            console.print()
+            console.print(
+                f"[cyan]Discovered schema:[/cyan] {len(discovered.entity_types)} entity types, {len(discovered.relation_types)} relation types"
+            )
+            console.print(f"  Entity types: {', '.join(discovered.entity_types.keys())}")
+            console.print(f"  Saved to: {discovered_path}")
+
+    # Summary
+    successful = [r for r in results if not r.error]
+    total_entities = sum(len(r.entities) for r in successful)
+    total_relations = sum(len(r.relations) for r in successful)
+
+    console.print()
+    console.print("[green]Extraction complete![/green]")
+    console.print(f"  Documents processed: {len(successful)}/{len(docs)}")
+    console.print(f"  Entities extracted: {total_entities}")
+    console.print(f"  Relations extracted: {total_relations}")
+    console.print(f"  Total cost: ${llm.total_cost_usd:.4f}")
+    console.print(f"  Output: {output_dir / 'extractions'}")
+    console.print()
+    console.print("Next: [cyan]sift build[/cyan] to construct the knowledge graph")
+
+
+@app.command()
+def build(
+    domain: str | None = typer.Option(None, help="Path to custom domain YAML"),
+    domain_name: str = typer.Option(
+        "schema-free", "--domain-name", "-d", help="Bundled domain name (e.g. general, osint)"
+    ),
+    output: str | None = typer.Option(None, "-o", help="Output directory"),
+    review_threshold: float = typer.Option(0.7, help="Flag relations below this confidence"),
+    no_postprocess: bool = typer.Option(False, help="Skip redundancy removal"),
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Verbose logging"),
+) -> None:
+    """Build knowledge graph from extraction results."""
+    _setup_logging(verbose)
+    config = SiftConfig()
+    output_dir = Path(output) if output else config.output_dir
+
+    # Load domain config to check review_required relation types
+    if domain:
+        config.domain_path = Path(domain)
+    domain_config = _load_domain(config, domain_name)
+
+    from sift_kg.graph.builder import build_graph, flag_relations_for_review, load_extractions
+
+    extractions = load_extractions(output_dir)
+    if not extractions:
+        console.print(f"[yellow]No extractions found in {output_dir / 'extractions'}[/yellow]")
+        console.print("Run [cyan]sift extract[/cyan] first.")
+        raise typer.Exit(1)
+
+    console.print(f"[cyan]Loading:[/cyan] {len(extractions)} extraction files")
+
+    # Schema-free mode: use discovered domain if available for normalization
+    if domain_config.schema_free:
+        from sift_kg.domains.discovery import load_discovered_domain
+
+        discovered = load_discovered_domain(output_dir / "discovered_domain.yaml")
+        if discovered:
+            console.print(
+                f"[cyan]Using discovered schema:[/cyan] {len(discovered.entity_types)} entity types"
+            )
+            domain_rel_types = (
+                set(discovered.relation_types.keys()) if discovered.relation_types else None
+            )
+            domain_rel_configs = (
+                {
+                    name: (cfg.source_types, cfg.target_types, cfg.symmetric)
+                    for name, cfg in discovered.relation_types.items()
+                }
+                if discovered.relation_types
+                else None
+            )
+        else:
+            domain_rel_types = None
+            domain_rel_configs = None
+    else:
+        domain_rel_types = (
+            set(domain_config.relation_types.keys()) if domain_config.relation_types else None
+        )
+        domain_rel_configs = (
+            {
+                name: (cfg.source_types, cfg.target_types, cfg.symmetric)
+                for name, cfg in domain_config.relation_types.items()
+            }
+            if domain_config.relation_types
+            else None
+        )
+    domain_canonical = {
+        name: (cfg.canonical_names, cfg.canonical_fallback_type)
+        for name, cfg in domain_config.entity_types.items()
+        if cfg.canonical_names
+    } or None
+    kg = build_graph(
+        extractions,
+        postprocess=not no_postprocess,
+        domain_relation_types=domain_rel_types,
+        domain_relation_configs=domain_rel_configs,
+        domain_canonical_entities=domain_canonical,
+    )
+
+    # Save graph
+    graph_path = output_dir / "graph_data.json"
+    kg.save(graph_path)
+
+    # Detect communities (Louvain, no LLM needed)
+    from sift_kg.graph.communities import detect_communities, save_communities
+
+    communities = detect_communities(kg)
+    if communities:
+        save_communities(communities, output_dir)
+        console.print(f"  Communities: {len(communities)} detected")
+    else:
+        # Write empty communities.json so downstream commands know build ran
+        (output_dir / "communities.json").write_text("{}", encoding="utf-8")
+
+    # Flag relations for review
+    review_types = {
+        name for name, cfg in domain_config.relation_types.items() if cfg.review_required
+    }
+    flagged = flag_relations_for_review(kg, review_threshold, review_types)
+
+    if flagged:
+        from sift_kg.resolve.io import write_relation_review
+        from sift_kg.resolve.models import RelationReviewEntry, RelationReviewFile
+
+        entries = [RelationReviewEntry(**f) for f in flagged]
+        review_file = RelationReviewFile(review_threshold=review_threshold, relations=entries)
+        review_path = output_dir / "relation_review.yaml"
+        write_relation_review(review_file, review_path)
+
+    console.print()
+    console.print("[green]Graph built![/green]")
+    console.print(f"  Entities: {kg.entity_count}")
+    console.print(f"  Relations: {kg.relation_count}")
+    if flagged:
+        console.print(f"  Flagged for review: {len(flagged)} relations")
+    console.print(f"  Output: {graph_path}")
+    console.print()
+    console.print("Next: [cyan]sift resolve[/cyan] to find duplicate entities")
+
+
+@app.command()
+def resolve(
+    model: str = typer.Option(None, help="LLM model for entity resolution"),
+    domain: str | None = typer.Option(None, help="Path to custom domain YAML"),
+    domain_name: str = typer.Option(
+        "schema-free", "--domain-name", "-d", help="Bundled domain name (e.g. general, osint)"
+    ),
+    concurrency: int = typer.Option(4, "-c", "--concurrency", help="Concurrent LLM calls"),
+    rpm: int = typer.Option(40, "--rpm", help="Max requests per minute"),
+    use_embeddings: bool = typer.Option(
+        False,
+        "--embeddings",
+        help="Use semantic clustering (requires: pip install sift-kg[embeddings])",
+    ),
+    output: str | None = typer.Option(None, "-o", help="Output directory"),
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Verbose logging"),
+) -> None:
+    """Find duplicate entities using LLM-based resolution."""
+    _setup_logging(verbose)
+    config = SiftConfig()
+    effective_model = model or config.default_model
+    output_dir = Path(output) if output else config.output_dir
+
+    try:
+        config.validate_api_keys(effective_model)
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1) from None
+
+    # Load domain for system context
+    if domain:
+        config.domain_path = Path(domain)
+    domain_config = _load_domain(config, domain_name)
+    system_context = domain_config.system_context or ""
+
+    graph_path = output_dir / "graph_data.json"
+    if not graph_path.exists():
+        console.print("[yellow]No graph found.[/yellow] Run [cyan]sift build[/cyan] first.")
+        raise typer.Exit(1)
+
+    from sift_kg.extract.llm_client import LLMClient
+    from sift_kg.graph.knowledge_graph import KnowledgeGraph
+    from sift_kg.resolve.io import read_relation_review, write_proposals, write_relation_review
+    from sift_kg.resolve.models import RelationReviewFile
+    from sift_kg.resolve.resolver import find_merge_candidates
+
+    kg = KnowledgeGraph.load(graph_path)
+    console.print(f"[cyan]Domain:[/cyan] {domain_config.name}")
+    console.print(f"[cyan]Graph:[/cyan] {kg.entity_count} entities, {kg.relation_count} relations")
+
+    llm = LLMClient(model=effective_model, rpm=rpm)
+    merge_file, variant_relations = find_merge_candidates(
+        kg,
+        llm,
+        concurrency=concurrency,
+        use_embeddings=use_embeddings,
+        system_context=system_context,
+    )
+
+    if not merge_file.proposals and not variant_relations:
+        console.print("[green]No duplicates or variant relationships found![/green]")
+        return
+
+    if merge_file.proposals:
+        proposals_path = output_dir / "merge_proposals.yaml"
+        write_proposals(merge_file, proposals_path)
+
+    # Append variant relations to relation_review.yaml
+    if variant_relations:
+        review_path = output_dir / "relation_review.yaml"
+        if review_path.exists():
+            review_file = read_relation_review(review_path)
+        else:
+            review_file = RelationReviewFile()
+        # Avoid duplicating existing entries
+        existing = {(r.source_id, r.target_id, r.relation_type) for r in review_file.relations}
+        new_variants = [
+            v
+            for v in variant_relations
+            if (v.source_id, v.target_id, v.relation_type) not in existing
+        ]
+        review_file.relations.extend(new_variants)
+        write_relation_review(review_file, review_path)
+
+    console.print()
+    if merge_file.proposals:
+        console.print(f"[green]Found {len(merge_file.proposals)} merge proposals[/green]")
+    if variant_relations:
+        console.print(
+            f"[green]Found {len(variant_relations)} variant relationships (EXTENDS)[/green]"
+        )
+    console.print(f"  Cost: ${llm.total_cost_usd:.4f}")
+    console.print(f"  Output: {output_dir}")
+    console.print()
+    console.print("Next: [cyan]sift review[/cyan] to approve/reject merges and relations")
+    console.print("  Then: [cyan]sift apply-merges[/cyan]")
+
+
+@app.command(name="apply-merges")
+def apply_merges_cmd(
+    output: str | None = typer.Option(None, "-o", help="Output directory"),
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Verbose logging"),
+) -> None:
+    """Apply confirmed entity merges and relation rejections."""
+    _setup_logging(verbose)
+    config = SiftConfig()
+    output_dir = Path(output) if output else config.output_dir
+
+    graph_path = output_dir / "graph_data.json"
+    if not graph_path.exists():
+        console.print("[yellow]No graph found.[/yellow] Run [cyan]sift build[/cyan] first.")
+        raise typer.Exit(1)
+
+    from sift_kg.graph.knowledge_graph import KnowledgeGraph
+    from sift_kg.resolve.engine import apply_merges, apply_relation_rejections
+    from sift_kg.resolve.io import read_proposals, read_relation_review
+
+    kg = KnowledgeGraph.load(graph_path)
+    console.print(f"[cyan]Graph:[/cyan] {kg.entity_count} entities, {kg.relation_count} relations")
+
+    # Apply entity merges
+    proposals_path = output_dir / "merge_proposals.yaml"
+    merge_stats = {"merges_applied": 0}
+    if proposals_path.exists():
+        merge_file = read_proposals(proposals_path)
+        confirmed_count = len(merge_file.confirmed)
+        if confirmed_count:
+            merge_stats = apply_merges(kg, merge_file)
+            console.print(f"  Entity merges applied: {merge_stats['merges_applied']}")
+        else:
+            console.print("  No confirmed entity merges found")
+    else:
+        console.print("  No merge proposals file found")
+
+    # Apply relation rejections
+    review_path = output_dir / "relation_review.yaml"
+    rejected_count = 0
+    if review_path.exists():
+        review_file = read_relation_review(review_path)
+        rejected_count = apply_relation_rejections(kg, review_file)
+        if rejected_count:
+            console.print(f"  Relations rejected: {rejected_count}")
+
+    if merge_stats.get("merges_applied", 0) or rejected_count:
+        kg.save(graph_path)
+        console.print()
+        console.print("[green]Graph updated![/green]")
+        console.print(f"  Entities: {kg.entity_count}")
+        console.print(f"  Relations: {kg.relation_count}")
+    else:
+        console.print()
+        console.print("[yellow]No changes to apply.[/yellow]")
+        console.print("Edit merge_proposals.yaml or relation_review.yaml first.")
+
+    console.print()
+    console.print("Next: [cyan]sift narrate[/cyan] to generate narrative summary")
+
+
+# ============================================================================
+# Review Commands
+# ============================================================================
+
+
+@app.command()
+def review(
+    output: str | None = typer.Option(None, "-o", help="Output directory"),
+    auto_approve: float = typer.Option(
+        0.85,
+        "--auto-approve",
+        help="Auto-confirm proposals where all members meet this confidence (0-1). Set to 1.0 to disable.",
+    ),
+    auto_reject: float = typer.Option(
+        0.5,
+        "--auto-reject",
+        help="Auto-reject relations below this confidence (0-1). Set to 0.0 to disable.",
+    ),
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Verbose logging"),
+) -> None:
+    """Interactively review merge proposals and flagged relations."""
+    _setup_logging(verbose)
+    config = SiftConfig()
+    output_dir = Path(output) if output else config.output_dir
+
+    from sift_kg.resolve.io import (
+        read_proposals,
+        read_relation_review,
+        write_proposals,
+        write_relation_review,
+    )
+    from sift_kg.resolve.reviewer import review_merges, review_relations
+
+    proposals_path = output_dir / "merge_proposals.yaml"
+    review_path = output_dir / "relation_review.yaml"
+
+    has_merges = proposals_path.exists()
+    has_relations = review_path.exists()
+
+    if not has_merges and not has_relations:
+        console.print("[yellow]Nothing to review.[/yellow]")
+        console.print(
+            "Run [cyan]sift resolve[/cyan] (entity merges) or [cyan]sift build[/cyan] (relation flags) first."
+        )
+        raise typer.Exit(0)
+
+    # Review merge proposals
+    if has_merges:
+        merge_file = read_proposals(proposals_path)
+        if merge_file.draft:
+            review_merges(merge_file, auto_approve_threshold=auto_approve)
+            write_proposals(merge_file, proposals_path)
+            console.print()
+        else:
+            console.print("[dim]No DRAFT merge proposals to review.[/dim]")
+
+    # Review flagged relations
+    if has_relations:
+        relation_file = read_relation_review(review_path)
+        if relation_file.draft:
+            review_relations(
+                relation_file,
+                auto_approve_threshold=auto_approve,
+                auto_reject_threshold=auto_reject,
+            )
+            write_relation_review(relation_file, review_path)
+            console.print()
+        else:
+            console.print("[dim]No DRAFT flagged relations to review.[/dim]")
+
+    console.print()
+    console.print("Next: [cyan]sift apply-merges[/cyan] to apply your decisions")
+
+
+# ============================================================================
+# Utility Commands
+# ============================================================================
+
+
+@app.command()
+def search(
+    query: str = typer.Argument(..., help="Search term (matches entity names and aliases)"),
+    relations: bool = typer.Option(False, "-r", "--relations", help="Show connected entities"),
+    description: bool = typer.Option(
+        False, "-d", "--description", help="Show entity description (requires sift narrate)"
+    ),
+    entity_type: str | None = typer.Option(
+        None, "-t", "--type", help="Filter by entity type (e.g. PERSON)"
+    ),
+    output: str | None = typer.Option(None, "-o", help="Output directory"),
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Verbose logging"),
+    as_json: bool = typer.Option(False, "--json", help="Output as JSON (for agent consumption)"),
+) -> None:
+    """Search entities in the knowledge graph by name or alias."""
+    _setup_logging(verbose)
+    config = SiftConfig()
+    output_dir = Path(output) if output else config.output_dir
+
+    graph_path = output_dir / "graph_data.json"
+    if not graph_path.exists():
+        console.print("[yellow]No graph found.[/yellow] Run [cyan]sift build[/cyan] first.")
+        raise typer.Exit(1)
+
+    import json as json_mod
+
+    from sift_kg.graph.knowledge_graph import KnowledgeGraph
+
+    kg = KnowledgeGraph.load(graph_path)
+
+    # Load descriptions if requested
+    descriptions: dict[str, str] = {}
+    if description:
+        desc_path = output_dir / "entity_descriptions.json"
+        if desc_path.exists():
+            descriptions = json_mod.loads(desc_path.read_text())
+        else:
+            console.print("[dim]No descriptions found. Run [cyan]sift narrate[/cyan] first.[/dim]")
+
+    query_lower = query.lower()
+    matches: list[tuple[str, dict]] = []
+
+    for node_id, data in kg.graph.nodes(data=True):
+        name = data.get("name", "")
+        if entity_type and data.get("entity_type", "").upper() != entity_type.upper():
+            continue
+
+        # Search name
+        if query_lower in name.lower():
+            matches.append((node_id, data))
+            continue
+
+        # Search aliases
+        attrs = data.get("attributes", {})
+        aliases = attrs.get("aliases", []) or attrs.get("also_known_as", [])
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        if any(query_lower in str(a).lower() for a in aliases):
+            matches.append((node_id, data))
+
+    def _substantive_degree(node_id: str) -> int:
+        """Count connections excluding DOCUMENT nodes and MENTIONED_IN edges."""
+        count = 0
+        for _, target, edata in kg.graph.edges(node_id, data=True):
+            if edata.get("relation_type") != "MENTIONED_IN" and kg.graph.nodes[target].get("entity_type") != "DOCUMENT":
+                count += 1
+        for source, _, edata in kg.graph.in_edges(node_id, data=True):
+            if source == node_id:
+                continue
+            if edata.get("relation_type") != "MENTIONED_IN" and kg.graph.nodes[source].get("entity_type") != "DOCUMENT":
+                count += 1
+        return count
+
+    if as_json:
+        import json as json_mod
+        from typing import Any
+
+        results = []
+        for node_id, data in matches:
+            entry: dict[str, Any] = {
+                "id": node_id,
+                "name": data.get("name", ""),
+                "entity_type": data.get("entity_type", "UNKNOWN"),
+                "connections": _substantive_degree(node_id),
+                "sources": data.get("source_documents", []),
+            }
+            attrs = data.get("attributes", {})
+            aliases = attrs.get("aliases", []) or attrs.get("also_known_as", [])
+            if isinstance(aliases, str):
+                aliases = [aliases] if aliases else []
+            if aliases:
+                entry["aliases"] = [str(a) for a in aliases]
+
+            if description and node_id in descriptions:
+                entry["description"] = descriptions[node_id]
+
+            if relations:
+                rels = []
+                for _, target, edata in kg.graph.edges(node_id, data=True):
+                    if edata.get("relation_type") == "MENTIONED_IN":
+                        continue
+                    rels.append({
+                        "direction": "outgoing",
+                        "type": edata.get("relation_type", "RELATED_TO"),
+                        "target_id": target,
+                        "target_name": kg.graph.nodes[target].get("name", target),
+                    })
+                for source, _, edata in kg.graph.in_edges(node_id, data=True):
+                    if source == node_id:
+                        continue
+                    if edata.get("relation_type") == "MENTIONED_IN":
+                        continue
+                    rels.append({
+                        "direction": "incoming",
+                        "type": edata.get("relation_type", "RELATED_TO"),
+                        "source_id": source,
+                        "source_name": kg.graph.nodes[source].get("name", source),
+                    })
+                entry["relations"] = rels
+
+            results.append(entry)
+
+        print(json_mod.dumps({"query": query, "results": results}, indent=2))
+        raise typer.Exit(0)
+
+    if not matches:
+        console.print(f'[yellow]No entities matching "{query}"[/yellow]')
+        raise typer.Exit(0)
+
+    console.print(f"[cyan]{len(matches)} result{'s' if len(matches) != 1 else ''}[/cyan]\n")
+
+    for node_id, data in matches:
+        name = data.get("name", "")
+        etype = data.get("entity_type", "UNKNOWN")
+        degree = kg.graph.degree(node_id)
+        sources = data.get("source_documents", [])
+
+        # Aliases
+        attrs = data.get("attributes", {})
+        aliases = attrs.get("aliases", []) or attrs.get("also_known_as", [])
+        if isinstance(aliases, str):
+            aliases = [aliases] if aliases else []
+
+        console.print(f"  [bold]{etype}:[/bold] {name}")
+        if aliases:
+            console.print(f"    [dim]aka:[/dim] {', '.join(str(a) for a in aliases)}")
+        console.print(f"    [dim]Connections:[/dim] {degree}")
+        if sources:
+            console.print(f"    [dim]Sources:[/dim] {', '.join(sources)}")
+
+        # Description
+        if description and node_id in descriptions:
+            desc_text = descriptions[node_id]
+            if len(desc_text) > 300:
+                desc_text = desc_text[:300] + "..."
+            console.print(f"    [dim]Description:[/dim] {desc_text}")
+
+        # Relations
+        if relations:
+            limit = 1000 if verbose else 10
+            all_rels: list[str] = []
+
+            for _, target, edata in kg.graph.edges(node_id, data=True):
+                rel = edata.get("relation_type", "RELATED_TO")
+                target_name = kg.graph.nodes[target].get("name", target)
+                all_rels.append(f"    [green]→[/green] {rel} → {target_name}")
+
+            for source, _, edata in kg.graph.in_edges(node_id, data=True):
+                if source == node_id:
+                    continue
+                rel = edata.get("relation_type", "RELATED_TO")
+                source_name = kg.graph.nodes[source].get("name", source)
+                all_rels.append(f"    [green]←[/green] {source_name} → {rel}")
+
+            for line in all_rels[:limit]:
+                console.print(line)
+            if len(all_rels) > limit:
+                console.print(
+                    f"    [dim]... {len(all_rels) - limit} more (use --verbose to show all)[/dim]"
+                )
+
+        console.print()
+
+
+@app.command()
+def export(
+    fmt: str = typer.Argument("graphml", help="Export format: json, graphml, gexf, csv"),
+    output: str | None = typer.Option(None, "-o", help="Output directory"),
+    export_path: str | None = typer.Option(None, "--to", help="Export file/directory path"),
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Verbose logging"),
+) -> None:
+    """Export the knowledge graph to GraphML, GEXF, CSV, or JSON."""
+    _setup_logging(verbose)
+    config = SiftConfig()
+    output_dir = Path(output) if output else config.output_dir
+
+    graph_path = output_dir / "graph_data.json"
+    if not graph_path.exists():
+        console.print("[yellow]No graph found.[/yellow] Run [cyan]sift build[/cyan] first.")
+        raise typer.Exit(1)
+
+    from sift_kg.export import SUPPORTED_FORMATS, export_graph
+    from sift_kg.graph.knowledge_graph import KnowledgeGraph
+
+    if fmt.lower() not in SUPPORTED_FORMATS:
+        console.print(f"[red]Unsupported format:[/red] {fmt}")
+        console.print(f"Supported: {', '.join(SUPPORTED_FORMATS)}")
+        raise typer.Exit(1)
+
+    # Guard: catch `sift export --to json` (user meant `sift export json`)
+    if export_path and export_path.lower() in SUPPORTED_FORMATS and fmt == "graphml":
+        fmt = export_path.lower()
+        export_path = None
+
+    kg = KnowledgeGraph.load(graph_path)
+
+    # Load entity descriptions if available (from sift narrate)
+    descriptions: dict[str, str] | None = None
+    desc_path = output_dir / "entity_descriptions.json"
+    if desc_path.exists():
+        import json
+
+        descriptions = json.loads(desc_path.read_text())
+        console.print(f"  Including {len(descriptions)} entity descriptions")
+
+    if export_path:
+        dest = Path(export_path)
+    elif fmt == "csv":
+        dest = output_dir / "csv"
+    else:
+        ext = {"json": "json", "graphml": "graphml", "gexf": "gexf", "sqlite": "sqlite"}[
+            fmt.lower()
+        ]
+        dest = output_dir / f"graph.{ext}"
+
+    result = export_graph(kg, dest, fmt, descriptions=descriptions)
+
+    console.print(f"[green]Exported![/green] ({fmt.upper()})")
+    console.print(f"  Entities: {kg.entity_count}")
+    console.print(f"  Relations: {kg.relation_count}")
+    if fmt.lower() == "csv":
+        console.print(f"  Output: {result}/entities.csv, {result}/relations.csv")
+    else:
+        console.print(f"  Output: {result}")
+
+
+@app.command()
+def view(
+    output: str | None = typer.Option(None, "-o", help="Output directory"),
+    to: str | None = typer.Option(None, "--to", help="Output HTML path"),
+    no_open: bool = typer.Option(False, "--no-open", help="Don't open in browser"),
+    top: int | None = typer.Option(None, "--top", help="Show only top N entities by degree"),
+    min_confidence: float | None = typer.Option(
+        None, "--min-confidence", help="Hide nodes/edges below this confidence (0.0-1.0)"
+    ),
+    source_doc: str | None = typer.Option(
+        None, "--source-doc", help="Show only entities from this document"
+    ),
+    neighborhood: str | None = typer.Option(
+        None, "--neighborhood", help="Center on entity and show N-hop neighborhood"
+    ),
+    depth: int = typer.Option(1, "--depth", help="Neighborhood hops [default: 1]"),
+    community: str | None = typer.Option(
+        None, "--community", help="Focus on a specific community (e.g. 'Community 1')"
+    ),
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Verbose logging"),
+) -> None:
+    """Open an interactive graph visualization in your browser."""
+    _setup_logging(verbose)
+    config = SiftConfig()
+    output_dir = Path(output) if output else config.output_dir
+
+    graph_path = output_dir / "graph_data.json"
+    if not graph_path.exists():
+        console.print("[yellow]No graph found.[/yellow] Run [cyan]sift build[/cyan] first.")
+        raise typer.Exit(1)
+
+    from sift_kg.graph.knowledge_graph import KnowledgeGraph
+    from sift_kg.graph.postprocessor import strip_metadata
+    from sift_kg.visualize import filter_graph, generate_view
+
+    kg = KnowledgeGraph.load(graph_path)
+    dest = Path(to) if to else output_dir / "graph.html"
+
+    # Load entity descriptions if narrate has been run
+    desc_path = output_dir / "entity_descriptions.json"
+    if desc_path.exists():
+        console.print(f"[cyan]Descriptions:[/cyan] loaded from {desc_path.name}")
+
+    result = generate_view(
+        kg,
+        dest,
+        open_browser=not no_open,
+        descriptions_path=desc_path if desc_path.exists() else None,
+        top_n=top,
+        min_confidence=min_confidence,
+        source_doc=source_doc,
+        neighborhood=neighborhood,
+        depth=depth,
+        community=community,
+    )
+
+    filters = []
+    if top:
+        filters.append(f"top {top}")
+    if min_confidence:
+        filters.append(f"confidence >= {min_confidence}")
+    if source_doc:
+        filters.append(f"doc: {source_doc}")
+    if neighborhood:
+        filters.append(f"neighborhood: {neighborhood} (depth {depth})")
+    if community:
+        filters.append(f"community: {community}")
+    if filters:
+        console.print(f"[cyan]Filters:[/cyan] {', '.join(filters)}")
+
+    # Show accurate stats (strip metadata + apply filters to match what was rendered)
+    clean_kg = strip_metadata(kg)
+    any_filter = top or min_confidence or source_doc or neighborhood
+    if any_filter:
+        clean_kg = filter_graph(
+            clean_kg,
+            top_n=top,
+            min_confidence=min_confidence,
+            source_doc=source_doc,
+            neighborhood=neighborhood,
+            depth=depth,
+        )
+    entity_ct, relation_ct = clean_kg.entity_count, clean_kg.relation_count
+
+    console.print("[green]View generated![/green]")
+    console.print(f"  Entities: {entity_ct}")
+    console.print(f"  Relations: {relation_ct}")
+    console.print(f"  Output: {result}")
+    if no_open:
+        console.print(f"  Open in browser: [cyan]file://{result.resolve()}[/cyan]")
+
+
+@app.command()
+def domains() -> None:
+    """List available bundled domains."""
+    from sift_kg.domains.loader import DomainLoader
+
+    loader = DomainLoader()
+    available = loader.list_bundled()
+
+    if not available:
+        console.print("[yellow]No bundled domains found.[/yellow]")
+        raise typer.Exit(0)
+
+    table = Table(title="Available Domains", show_header=True, header_style="bold cyan")
+    table.add_column("Name", style="green")
+    table.add_column("Description")
+    table.add_column("Entities", justify="right")
+    table.add_column("Relations", justify="right")
+
+    for name in available:
+        domain_config = loader.load_bundled(name)
+        desc = domain_config.description.strip().split("\n")[0]  # First line
+        table.add_row(
+            name,
+            desc,
+            str(len(domain_config.entity_types)),
+            str(len(domain_config.relation_types)),
+        )
+
+    console.print(table)
+    console.print()
+    console.print("Usage: [cyan]sift extract ./docs --domain-name osint[/cyan]")
+    console.print("Custom: [cyan]sift extract ./docs --domain path/to/domain.yaml[/cyan]")
+
+
+@app.command()
+def narrate(
+    model: str = typer.Option(None, help="LLM model for narrative generation"),
+    domain: str | None = typer.Option(None, help="Path to custom domain YAML"),
+    domain_name: str = typer.Option(
+        "schema-free", "--domain-name", "-d", help="Bundled domain name (e.g. general, osint)"
+    ),
+    output: str | None = typer.Option(None, "-o", help="Output directory"),
+    no_descriptions: bool = typer.Option(False, help="Skip per-entity descriptions"),
+    max_cost: float | None = typer.Option(None, help="Maximum cost budget in USD"),
+    communities_only: bool = typer.Option(
+        False, "--communities-only", help="Only regenerate community labels (~$0.01)"
+    ),
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Verbose logging"),
+) -> None:
+    """Generate narrative summary from the knowledge graph."""
+    _setup_logging(verbose)
+    config = SiftConfig()
+    effective_model = model or config.default_model
+    output_dir = Path(output) if output else config.output_dir
+
+    try:
+        config.validate_api_keys(effective_model)
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1) from None
+
+    graph_path = output_dir / "graph_data.json"
+    if not graph_path.exists():
+        console.print("[yellow]No graph found.[/yellow] Run [cyan]sift build[/cyan] first.")
+        raise typer.Exit(1)
+
+    from sift_kg.extract.llm_client import LLMClient
+    from sift_kg.graph.knowledge_graph import KnowledgeGraph
+
+    kg = KnowledgeGraph.load(graph_path)
+
+    if communities_only:
+        from sift_kg.narrate.generator import regenerate_communities
+
+        llm = LLMClient(model=effective_model)
+        comm_path = regenerate_communities(kg=kg, llm=llm, output_dir=output_dir)
+        console.print(f"[green]Communities regenerated:[/green] {comm_path}")
+        console.print(f"  Cost: ${llm.total_cost_usd:.4f}")
+        return
+
+    # Load domain for system context
+    if domain:
+        config.domain_path = Path(domain)
+    domain_config = _load_domain(config, domain_name)
+    system_context = domain_config.system_context or ""
+
+    from sift_kg.narrate.generator import generate_narrative
+
+    console.print(f"[cyan]Graph:[/cyan] {kg.entity_count} entities, {kg.relation_count} relations")
+    console.print(f"[cyan]Model:[/cyan] {effective_model}")
+    if max_cost:
+        console.print(f"[cyan]Budget:[/cyan] ${max_cost:.2f}")
+    console.print()
+
+    llm = LLMClient(model=effective_model)
+    narrative_path = generate_narrative(
+        kg=kg,
+        llm=llm,
+        output_dir=output_dir,
+        system_context=system_context,
+        include_entity_descriptions=not no_descriptions,
+        max_cost=max_cost,
+    )
+
+    console.print()
+    console.print("[green]Narrative generated![/green]")
+    console.print(f"  Output: {narrative_path}")
+    console.print(f"  Cost: ${llm.total_cost_usd:.4f}")
+    console.print()
+    console.print("Pipeline complete! Review the narrative at:")
+    console.print(f"  [cyan]{narrative_path}[/cyan]")
+
+
+@app.command()
+def init(
+    domain: str | None = typer.Option(
+        None, help="Path to custom domain YAML to set in project config"
+    ),
+) -> None:
+    """Initialize a new sift-kg project in the current directory."""
+    env_example_path = Path(".env.example")
+    sift_yaml_path = Path("sift.yaml")
+
+    # Create .env.example
+    if not env_example_path.exists() or typer.confirm(
+        "Overwrite existing .env.example?", default=False
+    ):
+        env_template = """# sift-kg Configuration
+# Copy this file to .env and fill in your API keys
+
+# === LLM API Keys ===
+# At least one required. Ollama needs no key (local models).
+SIFT_OPENAI_API_KEY=
+SIFT_ANTHROPIC_API_KEY=
+
+# === Model Configuration ===
+# Format: provider/model-name
+SIFT_DEFAULT_MODEL=openai/gpt-4o-mini
+"""
+        env_example_path.write_text(env_template)
+        console.print("[green]Created .env.example[/green]")
+
+    # Create sift.yaml project config
+    if not sift_yaml_path.exists() or typer.confirm("Overwrite existing sift.yaml?", default=False):
+        project_config = (
+            "# sift-kg project config\n# All commands pick up these settings automatically.\n\n"
+        )
+        if domain:
+            project_config += f"domain: {domain}\n"
+        else:
+            project_config += "# domain: path/to/domain.yaml\n"
+        project_config += "# model: openai/gpt-4o-mini\n"
+        project_config += "# output: output\n"
+        project_config += "\n# extraction:\n"
+        project_config += (
+            "#   backend: kreuzberg      # kreuzberg (default, 75+ formats) | pdfplumber\n"
+        )
+        project_config += "#   ocr_backend: tesseract   # tesseract | easyocr | paddleocr | gcv\n"
+        project_config += "#   ocr_language: eng\n"
+        sift_yaml_path.write_text(project_config)
+        console.print("[green]Created sift.yaml[/green]")
+
+    console.print("\nNext steps:")
+    console.print("  1. cp .env.example .env")
+    console.print("  2. Add your API key to .env")
+    if not domain:
+        console.print("  3. Edit sift.yaml to set your domain (or use --domain flag)")
+        console.print("  4. sift extract ./docs/")
+    else:
+        console.print("  3. sift extract ./docs/")
+    console.print()
+    console.print("Available domains: [cyan]sift domains[/cyan]")
+    raise typer.Exit(0)
+
+
+@app.command()
+def info(
+    output: str | None = typer.Option(None, "-o", help="Output directory"),
+    as_json: bool = typer.Option(False, "--json", help="Output as JSON (for agent consumption)"),
+) -> None:
+    """Display project configuration and processing stats."""
+    config = SiftConfig()
+    output_dir = Path(output) if output else config.output_dir
+    domain_config = _load_domain(config)
+
+    if as_json:
+        import json as json_mod
+        from typing import Any
+
+        from sift_kg.graph.postprocessor import strip_metadata
+
+        data: dict[str, Any] = {
+            "domain": domain_config.name,
+            "entity_types": domain_config.get_entity_type_names(),
+            "relation_type_count": len(domain_config.get_relation_type_names()),
+            "model": config.default_model,
+            "output_dir": str(output_dir),
+            "documents_processed": 0,
+        }
+
+        extractions_dir = output_dir / "extractions"
+        if extractions_dir.exists():
+            data["documents_processed"] = len(list(extractions_dir.glob("*.json")))
+
+        graph_path = output_dir / "graph_data.json"
+        if graph_path.exists():
+            from sift_kg.graph.knowledge_graph import KnowledgeGraph
+
+            kg = KnowledgeGraph.load(graph_path)
+            clean = strip_metadata(kg)
+            data["entities"] = clean.entity_count
+            data["relations"] = clean.relation_count
+
+        proposals_path = output_dir / "merge_proposals.yaml"
+        if proposals_path.exists():
+            from sift_kg.resolve.io import read_proposals
+
+            mf = read_proposals(proposals_path)
+            data["merge_proposals"] = {
+                "confirmed": len(mf.confirmed),
+                "draft": len(mf.draft),
+                "rejected": len(mf.rejected),
+            }
+
+        review_path = output_dir / "relation_review.yaml"
+        if review_path.exists():
+            from sift_kg.resolve.io import read_relation_review
+
+            rf = read_relation_review(review_path)
+            data["relation_review"] = {
+                "confirmed": len(rf.confirmed),
+                "draft": len(rf.draft),
+                "rejected": len(rf.rejected),
+            }
+
+        data["narrative_generated"] = (output_dir / "narrative.md").exists()
+
+        print(json_mod.dumps(data, indent=2))
+        raise typer.Exit(0)
+
+    table = Table(title="sift-kg Project Info", show_header=True, header_style="bold cyan")
+    table.add_column("Metric", style="dim")
+    table.add_column("Value")
+
+    table.add_row("Domain", domain_config.name)
+    table.add_row("Entity Types", ", ".join(domain_config.get_entity_type_names()))
+    table.add_row("Relation Types", str(len(domain_config.get_relation_type_names())))
+    table.add_row("Default Model", config.default_model)
+    table.add_row("Output Directory", str(output_dir))
+
+    extractions_dir = output_dir / "extractions"
+    if extractions_dir.exists():
+        doc_count = len(list(extractions_dir.glob("*.json")))
+        table.add_row("Documents Processed", str(doc_count))
+    else:
+        table.add_row("Documents Processed", "0")
+
+    graph_path = output_dir / "graph_data.json"
+    if graph_path.exists():
+        from sift_kg.graph.knowledge_graph import KnowledgeGraph
+
+        kg = KnowledgeGraph.load(graph_path)
+        table.add_row("Graph", f"{kg.entity_count} entities, {kg.relation_count} relations")
+    else:
+        table.add_row("Graph", "Not built")
+
+    # Check merge/review status
+    proposals_path = output_dir / "merge_proposals.yaml"
+    if proposals_path.exists():
+        from sift_kg.resolve.io import read_proposals
+
+        mf = read_proposals(proposals_path)
+        table.add_row(
+            "Merge Proposals",
+            f"{len(mf.confirmed)} confirmed, {len(mf.draft)} draft, {len(mf.rejected)} rejected",
+        )
+
+    review_path = output_dir / "relation_review.yaml"
+    if review_path.exists():
+        from sift_kg.resolve.io import read_relation_review
+
+        rf = read_relation_review(review_path)
+        table.add_row(
+            "Relation Review",
+            f"{len(rf.confirmed)} confirmed, {len(rf.draft)} draft, {len(rf.rejected)} rejected",
+        )
+
+    narrative_exists = (output_dir / "narrative.md").exists()
+    table.add_row("Narrative Generated", "Yes" if narrative_exists else "No")
+
+    console.print(table)
+    raise typer.Exit(0)
+
+
+@app.command()
+def topology(
+    output: str | None = typer.Option(None, "-o", help="Output directory"),
+    pretty: bool = typer.Option(False, "--pretty", help="Human-readable rich table output"),
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Verbose logging"),
+) -> None:
+    """Show structural topology of the knowledge graph (for agents)."""
+    _setup_logging(verbose)
+    config = SiftConfig()
+    output_dir = Path(output) if output else config.output_dir
+
+    graph_path = output_dir / "graph_data.json"
+    if not graph_path.exists():
+        console.print("[yellow]No graph found.[/yellow] Run [cyan]sift build[/cyan] first.")
+        raise typer.Exit(1)
+
+    comm_path = output_dir / "communities.json"
+    if not comm_path.exists():
+        console.print(
+            "[yellow]No communities found.[/yellow] Run [cyan]sift build[/cyan] first."
+        )
+        raise typer.Exit(1)
+
+    import json as json_mod
+
+    from sift_kg.graph.communities import (
+        find_bridges,
+        find_community_connections,
+        find_isolated,
+        load_communities_grouped,
+    )
+    from sift_kg.graph.knowledge_graph import KnowledgeGraph
+    from sift_kg.graph.postprocessor import strip_metadata
+
+    kg = KnowledgeGraph.load(graph_path)
+    clean = strip_metadata(kg)
+
+    # Community summary
+    grouped = load_communities_grouped(output_dir)
+    degree_map = dict(clean.graph.degree())
+    community_list = []
+
+    if not grouped:
+        # Graph too small for community detection — still output valid JSON
+        logging.debug("No communities detected (graph may be too small).")
+
+    for label, member_ids in grouped.items():
+        entity_types: dict[str, int] = {}
+        for eid in member_ids:
+            node = kg.graph.nodes.get(eid, {})
+            etype = node.get("entity_type", "UNKNOWN")
+            entity_types[etype] = entity_types.get(etype, 0) + 1
+
+        top = sorted(member_ids, key=lambda eid: degree_map.get(eid, 0), reverse=True)[:5]
+
+        # Count internal edges
+        member_set = set(member_ids)
+        internal = sum(
+            1 for u, v in clean.graph.to_undirected().edges()
+            if u in member_set and v in member_set
+        )
+
+        community_list.append({
+            "label": label,
+            "members": len(member_ids),
+            "top_entities": top,
+            "entity_types": entity_types,
+            "internal_edges": internal,
+        })
+    community_list.sort(key=lambda c: c["members"], reverse=True)
+
+    # Bridges, isolated, connections
+    bridges = find_bridges(kg, output_dir)
+    isolated = find_isolated(kg)
+    connections = find_community_connections(kg, output_dir)
+
+    result = {
+        "stats": {
+            "entities": clean.entity_count,
+            "relations": clean.relation_count,
+            "communities": len(grouped),
+            "bridges": len(bridges),
+            "isolated": len(isolated),
+        },
+        "communities": community_list,
+        "bridges": bridges,
+        "isolated": isolated,
+        "community_connections": connections,
+    }
+
+    if pretty:
+        # Human-readable output
+        console.print(f"[cyan]Entities:[/cyan] {clean.entity_count}")
+        console.print(f"[cyan]Relations:[/cyan] {clean.relation_count}")
+        console.print(f"[cyan]Communities:[/cyan] {len(grouped)}")
+        console.print(f"[cyan]Bridges:[/cyan] {len(bridges)}")
+        console.print(f"[cyan]Isolated:[/cyan] {len(isolated)}")
+        console.print()
+
+        if community_list:
+            table = Table(title="Communities", show_header=True, header_style="bold cyan")
+            table.add_column("Label")
+            table.add_column("Members", justify="right")
+            table.add_column("Internal Edges", justify="right")
+            table.add_column("Top Entities")
+            for comm in community_list:
+                top_names = []
+                for eid in comm["top_entities"]:
+                    name = kg.graph.nodes.get(eid, {}).get("name", eid)
+                    top_names.append(name)
+                table.add_row(
+                    comm["label"],
+                    str(comm["members"]),
+                    str(comm["internal_edges"]),
+                    ", ".join(top_names),
+                )
+            console.print(table)
+
+        if bridges:
+            console.print()
+            bridge_table = Table(title="Bridge Entities", show_header=True, header_style="bold cyan")
+            bridge_table.add_column("Entity")
+            bridge_table.add_column("Communities")
+            bridge_table.add_column("Cross-edges", justify="right")
+            for b in bridges[:20]:
+                bridge_table.add_row(
+                    b["name"],
+                    ", ".join(b["communities"]),
+                    str(b["cross_community_edges"]),
+                )
+            console.print(bridge_table)
+
+        if connections:
+            console.print()
+            conn_table = Table(title="Community Connections", show_header=True, header_style="bold cyan")
+            conn_table.add_column("From")
+            conn_table.add_column("To")
+            conn_table.add_column("Shared Edges", justify="right")
+            conn_table.add_column("Bridge Entities", justify="right")
+            for c in connections:
+                conn_table.add_row(c["from"], c["to"], str(c["shared_edges"]), str(c["bridge_entities"]))
+            console.print(conn_table)
+    else:
+        print(json_mod.dumps(result, indent=2))
+
+
+@app.command()
+def query(
+    query_str: str = typer.Argument(..., help="Entity name or exact entity ID"),
+    depth: int = typer.Option(1, "--depth", help="Number of neighborhood hops"),
+    entity_type: str | None = typer.Option(None, "-t", "--type", help="Filter by entity type"),
+    output: str | None = typer.Option(None, "-o", help="Output directory"),
+    pretty: bool = typer.Option(False, "--pretty", help="Human-readable rich output"),
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Verbose logging"),
+) -> None:
+    """Query entity neighborhood subgraph with topology context."""
+    _setup_logging(verbose)
+    config = SiftConfig()
+    output_dir = Path(output) if output else config.output_dir
+
+    graph_path = output_dir / "graph_data.json"
+    if not graph_path.exists():
+        console.print("[yellow]No graph found.[/yellow] Run [cyan]sift build[/cyan] first.")
+        raise typer.Exit(1)
+
+    import json as json_mod
+    from typing import Any
+
+    from sift_kg.graph.communities import extract_subgraph, get_entity_topology
+    from sift_kg.graph.knowledge_graph import KnowledgeGraph
+
+    kg = KnowledgeGraph.load(graph_path)
+
+    # --- Input resolution ---
+    matched_id: str | None = None
+    other_matches: list[dict[str, Any]] = []
+
+    if kg.graph.has_node(query_str):
+        matched_id = query_str
+    else:
+        query_lower = query_str.lower()
+        candidates: list[tuple[str, dict]] = []
+
+        for node_id, data in kg.graph.nodes(data=True):
+            if data.get("entity_type") == "DOCUMENT":
+                continue
+            if entity_type and data.get("entity_type", "").upper() != entity_type.upper():
+                continue
+
+            name = data.get("name", "")
+            if query_lower in name.lower():
+                candidates.append((node_id, data))
+                continue
+
+            attrs = data.get("attributes", {})
+            aliases = attrs.get("aliases", []) or attrs.get("also_known_as", [])
+            if isinstance(aliases, str):
+                aliases = [aliases]
+            if any(query_lower in str(a).lower() for a in aliases):
+                candidates.append((node_id, data))
+
+        if candidates:
+            def _sub_degree(nid: str) -> int:
+                count = 0
+                for _, target, edata in kg.graph.edges(nid, data=True):
+                    if edata.get("relation_type") != "MENTIONED_IN" and kg.graph.nodes[target].get("entity_type") != "DOCUMENT":
+                        count += 1
+                for source, _, edata in kg.graph.in_edges(nid, data=True):
+                    if source == nid:
+                        continue
+                    if edata.get("relation_type") != "MENTIONED_IN" and kg.graph.nodes[source].get("entity_type") != "DOCUMENT":
+                        count += 1
+                return count
+
+            candidates.sort(key=lambda c: _sub_degree(c[0]), reverse=True)
+            matched_id = candidates[0][0]
+
+            if len(candidates) > 1:
+                other_matches = [
+                    {
+                        "id": nid,
+                        "name": data.get("name", nid),
+                        "entity_type": data.get("entity_type", "UNKNOWN"),
+                    }
+                    for nid, data in candidates[1:]
+                ]
+
+    # --- Build result ---
+    if matched_id is None:
+        result: dict[str, Any] = {
+            "match": None,
+            "subgraph": {"nodes": [], "links": []},
+            "depth": depth,
+        }
+    else:
+        node_data = kg.graph.nodes.get(matched_id, {})
+
+        def _sub_degree_single(nid: str) -> int:
+            count = 0
+            for _, target, edata in kg.graph.edges(nid, data=True):
+                if edata.get("relation_type") != "MENTIONED_IN" and kg.graph.nodes[target].get("entity_type") != "DOCUMENT":
+                    count += 1
+            for source, _, edata in kg.graph.in_edges(nid, data=True):
+                if source == nid:
+                    continue
+                if edata.get("relation_type") != "MENTIONED_IN" and kg.graph.nodes[source].get("entity_type") != "DOCUMENT":
+                    count += 1
+            return count
+
+        topo = get_entity_topology(kg, matched_id, output_dir)
+        subgraph = extract_subgraph(kg, matched_id, depth=depth)
+
+        match_info: dict[str, Any] = {
+            "id": matched_id,
+            "name": node_data.get("name", matched_id),
+            "entity_type": node_data.get("entity_type", "UNKNOWN"),
+            "community": topo["community"],
+            "is_bridge": topo["is_bridge"],
+            "bridge_communities": topo["bridge_communities"],
+            "connections": _sub_degree_single(matched_id),
+        }
+
+        result = {
+            "match": match_info,
+            "subgraph": subgraph,
+            "depth": depth,
+        }
+
+        if other_matches:
+            result["other_matches"] = other_matches
+            result["note"] = "Multiple matches found. Re-query with exact entity ID for a specific result."
+
+    # --- Output ---
+    if pretty:
+        if result["match"] is None:
+            console.print(f'[yellow]No entities matching "{query_str}"[/yellow]')
+        else:
+            m = result["match"]
+            console.print(f"[bold]{m['entity_type']}:[/bold] {m['name']}")
+            console.print(f"  [dim]ID:[/dim] {m['id']}")
+            console.print(f"  [dim]Connections:[/dim] {m['connections']}")
+            if m["community"]:
+                console.print(f"  [dim]Community:[/dim] {m['community']}")
+            if m["is_bridge"]:
+                console.print(f"  [dim]Bridge to:[/dim] {', '.join(m['bridge_communities'])}")
+            console.print()
+
+            sg = result["subgraph"]
+            console.print(f"[cyan]Subgraph:[/cyan] {len(sg['nodes'])} nodes, {len(sg['links'])} edges (depth {depth})")
+
+            if sg["links"]:
+                table = Table(show_header=True, header_style="bold cyan")
+                table.add_column("Type")
+                table.add_column("Name")
+                table.add_column("Relation")
+                for link in sg["links"]:
+                    if link["source"] == m["id"]:
+                        target_name = next(
+                            (n["name"] for n in sg["nodes"] if n["id"] == link["target"]),
+                            link["target"],
+                        )
+                        table.add_row(
+                            next((n["entity_type"] for n in sg["nodes"] if n["id"] == link["target"]), ""),
+                            target_name,
+                            f"-> {link['relation_type']}",
+                        )
+                    elif link["target"] == m["id"]:
+                        source_name = next(
+                            (n["name"] for n in sg["nodes"] if n["id"] == link["source"]),
+                            link["source"],
+                        )
+                        table.add_row(
+                            next((n["entity_type"] for n in sg["nodes"] if n["id"] == link["source"]), ""),
+                            source_name,
+                            f"<- {link['relation_type']}",
+                        )
+                console.print(table)
+
+            if other_matches:
+                console.print()
+                console.print(f"[dim]{len(other_matches)} other matches. Re-query with exact entity ID.[/dim]")
+                for om in other_matches[:5]:
+                    console.print(f"  [dim]{om['entity_type']}: {om['name']} ({om['id']})[/dim]")
+    else:
+        print(json_mod.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    app()

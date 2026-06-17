@@ -1,0 +1,349 @@
+"""Tests for sift_kg.graph.communities."""
+
+import pytest
+
+from sift_kg.graph.knowledge_graph import KnowledgeGraph
+
+
+def _build_two_cluster_graph() -> KnowledgeGraph:
+    """Build a graph with two clearly separable clusters.
+
+    Cluster A: persons a1-a10 all connected to each other
+    Cluster B: persons b1-b10 all connected to each other
+    Single bridge: a1 -> b1
+    """
+    kg = KnowledgeGraph()
+    # Cluster A
+    for i in range(1, 11):
+        kg.add_entity(f"person:a{i}", "PERSON", f"A{i}")
+    for i in range(1, 11):
+        for j in range(i + 1, 11):
+            kg.add_relation(f"r_a{i}_{j}", f"person:a{i}", f"person:a{j}", "ASSOCIATED_WITH")
+
+    # Cluster B
+    for i in range(1, 11):
+        kg.add_entity(f"person:b{i}", "PERSON", f"B{i}")
+    for i in range(1, 11):
+        for j in range(i + 1, 11):
+            kg.add_relation(f"r_b{i}_{j}", f"person:b{i}", f"person:b{j}", "ASSOCIATED_WITH")
+
+    # Bridge
+    kg.add_relation("r_bridge", "person:a1", "person:b1", "ASSOCIATED_WITH")
+
+    # Add DOCUMENT nodes and MENTIONED_IN edges (should be stripped)
+    kg.add_entity("doc:test", "DOCUMENT", "test")
+    for i in range(1, 11):
+        kg.add_relation(f"r_doc_a{i}", f"person:a{i}", "doc:test", "MENTIONED_IN", canonicalize=False)
+
+    return kg
+
+
+class TestDetectCommunities:
+    """Test community detection."""
+
+    def test_detects_two_communities(self):
+        """Two dense clusters should be detected as separate communities."""
+        from sift_kg.graph.communities import detect_communities
+
+        kg = _build_two_cluster_graph()
+        communities = detect_communities(kg, min_community_size=3)
+        assert communities is not None
+        assert len(communities) >= 2
+
+    def test_strips_document_nodes(self):
+        """DOCUMENT nodes should not appear in community members."""
+        from sift_kg.graph.communities import detect_communities
+
+        kg = _build_two_cluster_graph()
+        communities = detect_communities(kg, min_community_size=3)
+        assert communities is not None
+        all_ids = [e["id"] for comm in communities for e in comm]
+        assert not any(eid.startswith("doc:") for eid in all_ids)
+
+    def test_returns_none_for_tiny_graph(self):
+        """Graph too small for meaningful communities returns None."""
+        from sift_kg.graph.communities import detect_communities
+
+        kg = KnowledgeGraph()
+        kg.add_entity("person:a", "PERSON", "A")
+        kg.add_entity("person:b", "PERSON", "B")
+        kg.add_relation("r1", "person:a", "person:b", "KNOWS")
+        result = detect_communities(kg)
+        assert result is None
+
+    def test_described_ids_filters_members(self):
+        """Only entities in described_ids appear in community output."""
+        from sift_kg.graph.communities import detect_communities
+
+        kg = _build_two_cluster_graph()
+        # Only include half the entities
+        described = {f"person:a{i}" for i in range(1, 6)}
+        communities = detect_communities(kg, described_ids=described, min_community_size=3)
+        if communities:
+            all_ids = {e["id"] for comm in communities for e in comm}
+            assert all_ids.issubset(described)
+
+    def test_sorted_by_total_degree(self):
+        """Communities are sorted by total degree (highest first)."""
+        from sift_kg.graph.communities import detect_communities
+
+        kg = _build_two_cluster_graph()
+        communities = detect_communities(kg, min_community_size=3)
+        if communities and len(communities) >= 2:
+            degree_map = dict(kg.graph.degree())
+            deg_0 = sum(degree_map.get(e["id"], 0) for e in communities[0])
+            deg_1 = sum(degree_map.get(e["id"], 0) for e in communities[1])
+            assert deg_0 >= deg_1
+
+
+class TestSaveLoadCommunities:
+    """Test community persistence."""
+
+    def test_save_and_load_roundtrip(self, tmp_dir):
+        """Save and load preserves community assignments."""
+        from sift_kg.graph.communities import load_communities, save_communities
+
+        communities = [
+            [{"id": "person:a1", "name": "A1", "entity_type": "PERSON"},
+             {"id": "person:a2", "name": "A2", "entity_type": "PERSON"}],
+            [{"id": "person:b1", "name": "B1", "entity_type": "PERSON"}],
+        ]
+        labels = {0: "Group Alpha", 1: "Group Beta"}
+        save_communities(communities, tmp_dir, labels=labels)
+
+        loaded = load_communities(tmp_dir)
+        assert loaded["person:a1"] == "Group Alpha"
+        assert loaded["person:a2"] == "Group Alpha"
+        assert loaded["person:b1"] == "Group Beta"
+
+    def test_save_without_labels_uses_generic(self, tmp_dir):
+        """Save without labels generates 'Community N' labels."""
+        from sift_kg.graph.communities import load_communities, save_communities
+
+        communities = [
+            [{"id": "person:a1", "name": "A1", "entity_type": "PERSON"}],
+            [{"id": "person:b1", "name": "B1", "entity_type": "PERSON"}],
+        ]
+        save_communities(communities, tmp_dir)
+
+        loaded = load_communities(tmp_dir)
+        assert loaded["person:a1"] == "Community 1"
+        assert loaded["person:b1"] == "Community 2"
+
+    def test_load_missing_file_returns_empty(self, tmp_dir):
+        """Loading from dir without communities.json returns empty dict."""
+        from sift_kg.graph.communities import load_communities
+
+        assert load_communities(tmp_dir) == {}
+
+    def test_load_grouped_inverts_mapping(self, tmp_dir):
+        """load_communities_grouped inverts entity→label to label→[entities]."""
+        from sift_kg.graph.communities import load_communities_grouped, save_communities
+
+        communities = [
+            [{"id": "person:a1", "name": "A1", "entity_type": "PERSON"},
+             {"id": "person:a2", "name": "A2", "entity_type": "PERSON"}],
+            [{"id": "person:b1", "name": "B1", "entity_type": "PERSON"}],
+        ]
+        labels = {0: "Alpha", 1: "Beta"}
+        save_communities(communities, tmp_dir, labels=labels)
+
+        grouped = load_communities_grouped(tmp_dir)
+        assert set(grouped["Alpha"]) == {"person:a1", "person:a2"}
+        assert grouped["Beta"] == ["person:b1"]
+
+
+class TestTopologyAnalysis:
+    """Test bridge, isolation, and community connection analysis."""
+
+    def test_find_bridges(self, tmp_dir):
+        """Bridge entities connect 2+ communities."""
+        from sift_kg.graph.communities import detect_communities, find_bridges, save_communities
+
+        kg = _build_two_cluster_graph()
+        communities = detect_communities(kg, min_community_size=3)
+        assert communities is not None
+
+        save_communities(communities, tmp_dir)
+        bridges = find_bridges(kg, tmp_dir)
+
+        # a1 connects both clusters
+        bridge_ids = {b["entity"] for b in bridges}
+        assert "person:a1" in bridge_ids or "person:b1" in bridge_ids
+
+    def test_find_isolated(self):
+        """Isolated entities have no substantive connections."""
+        from sift_kg.graph.communities import find_isolated
+
+        kg = KnowledgeGraph()
+        kg.add_entity("person:loner", "PERSON", "Loner")
+        kg.add_entity("person:connected", "PERSON", "Connected")
+        kg.add_entity("person:other", "PERSON", "Other")
+        kg.add_relation("r1", "person:connected", "person:other", "KNOWS")
+        # loner has no edges at all
+
+        isolated = find_isolated(kg)
+        isolated_ids = {i["entity"] for i in isolated}
+        assert "person:loner" in isolated_ids
+        assert "person:connected" not in isolated_ids
+
+    def test_find_isolated_metadata_only(self):
+        """Entity with only MENTIONED_IN edges is isolated."""
+        from sift_kg.graph.communities import find_isolated
+
+        kg = KnowledgeGraph()
+        kg.add_entity("person:meta_only", "PERSON", "MetaOnly")
+        kg.add_entity("doc:test", "DOCUMENT", "test")
+        kg.add_relation("r1", "person:meta_only", "doc:test", "MENTIONED_IN", canonicalize=False)
+
+        isolated = find_isolated(kg)
+        isolated_ids = {i["entity"] for i in isolated}
+        assert "person:meta_only" in isolated_ids
+
+    def test_community_connections(self, tmp_dir):
+        """Cross-community edges are detected."""
+        from sift_kg.graph.communities import (
+            detect_communities,
+            find_community_connections,
+            save_communities,
+        )
+
+        kg = _build_two_cluster_graph()
+        communities = detect_communities(kg, min_community_size=3)
+        assert communities is not None
+
+        save_communities(communities, tmp_dir)
+        connections = find_community_connections(kg, tmp_dir)
+
+        # There should be at least one cross-community connection
+        assert len(connections) >= 1
+        conn = connections[0]
+        assert "from" in conn
+        assert "to" in conn
+        assert "shared_edges" in conn
+        assert conn["shared_edges"] >= 1
+
+
+class TestSubgraphExtraction:
+    """Test subgraph extraction for sift query."""
+
+    def test_extract_subgraph_depth_1(self):
+        """Depth 1 returns direct neighbors only."""
+        from sift_kg.graph.communities import extract_subgraph
+
+        kg = _build_two_cluster_graph()
+        result = extract_subgraph(kg, "person:a1", depth=1)
+        node_ids = {n["id"] for n in result["nodes"]}
+        assert "person:a1" in node_ids
+        assert "person:b1" in node_ids
+        assert "person:b5" not in node_ids
+        assert not any(nid.startswith("doc:") for nid in node_ids)
+
+    def test_extract_subgraph_depth_2(self):
+        """Depth 2 returns more nodes than depth 1."""
+        from sift_kg.graph.communities import extract_subgraph
+
+        kg = _build_two_cluster_graph()
+        result_1 = extract_subgraph(kg, "person:a1", depth=1)
+        result_2 = extract_subgraph(kg, "person:a1", depth=2)
+        assert len(result_2["nodes"]) > len(result_1["nodes"])
+        node_ids_2 = {n["id"] for n in result_2["nodes"]}
+        assert "person:b5" in node_ids_2
+
+    def test_extract_subgraph_excludes_mentioned_in(self):
+        """MENTIONED_IN edges excluded from subgraph links."""
+        from sift_kg.graph.communities import extract_subgraph
+
+        kg = _build_two_cluster_graph()
+        result = extract_subgraph(kg, "person:a1", depth=1)
+        link_types = {link["relation_type"] for link in result["links"]}
+        assert "MENTIONED_IN" not in link_types
+
+    def test_extract_subgraph_nonexistent_entity(self):
+        """Nonexistent entity returns empty subgraph."""
+        from sift_kg.graph.communities import extract_subgraph
+
+        kg = _build_two_cluster_graph()
+        result = extract_subgraph(kg, "person:nobody", depth=1)
+        assert result["nodes"] == []
+        assert result["links"] == []
+
+    def test_extract_subgraph_has_edge_data(self):
+        """Links include relation_type and confidence."""
+        from sift_kg.graph.communities import extract_subgraph
+
+        kg = _build_two_cluster_graph()
+        result = extract_subgraph(kg, "person:a1", depth=1)
+        assert len(result["links"]) > 0
+        link = result["links"][0]
+        assert "source" in link
+        assert "target" in link
+        assert "relation_type" in link
+
+
+class TestEntityTopology:
+    """Test single-entity topology lookup."""
+
+    def test_bridge_entity(self, tmp_dir):
+        """Bridge entity has is_bridge=True and bridge_communities populated."""
+        from sift_kg.graph.communities import (
+            detect_communities,
+            get_entity_topology,
+            save_communities,
+        )
+
+        kg = _build_two_cluster_graph()
+        communities = detect_communities(kg, min_community_size=3)
+        assert communities is not None
+        save_communities(communities, tmp_dir)
+
+        topo = get_entity_topology(kg, "person:a1", tmp_dir)
+        assert topo["community"] is not None
+        assert topo["is_bridge"] is True
+        assert len(topo["bridge_communities"]) >= 1
+
+    def test_non_bridge_entity(self, tmp_dir):
+        """Interior entity is not a bridge."""
+        from sift_kg.graph.communities import (
+            detect_communities,
+            get_entity_topology,
+            save_communities,
+        )
+
+        kg = _build_two_cluster_graph()
+        communities = detect_communities(kg, min_community_size=3)
+        assert communities is not None
+        save_communities(communities, tmp_dir)
+
+        topo = get_entity_topology(kg, "person:a5", tmp_dir)
+        assert topo["community"] is not None
+        assert topo["is_bridge"] is False
+        assert topo["bridge_communities"] == []
+
+    def test_entity_not_in_communities(self, tmp_dir):
+        """Entity in graph but not in communities.json gets null community."""
+        from sift_kg.graph.communities import get_entity_topology, save_communities
+
+        kg = KnowledgeGraph()
+        kg.add_entity("person:loner", "PERSON", "Loner")
+        save_communities([], tmp_dir)
+
+        topo = get_entity_topology(kg, "person:loner", tmp_dir)
+        assert topo["community"] is None
+        assert topo["is_bridge"] is False
+
+    def test_missing_communities_file(self):
+        """Missing communities.json returns null/empty topology."""
+        import tempfile
+        from pathlib import Path
+
+        from sift_kg.graph.communities import get_entity_topology
+
+        kg = KnowledgeGraph()
+        kg.add_entity("person:a", "PERSON", "A")
+
+        with tempfile.TemporaryDirectory() as d:
+            topo = get_entity_topology(kg, "person:a", Path(d))
+        assert topo["community"] is None
+        assert topo["is_bridge"] is False
+        assert topo["bridge_communities"] == []

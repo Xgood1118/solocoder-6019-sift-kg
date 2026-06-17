@@ -1,0 +1,600 @@
+# sift-kg
+
+**Turn any collection of documents into a knowledge graph.**
+
+No code, no database, no infrastructure — just a CLI and your documents. Drop in PDFs, papers, articles, or records — get a browsable knowledge graph that shows how everything connects, in minutes. sift-kg extracts entities and relationships via LLM, deduplicates with your approval, and generates an interactive viewer you can explore in your browser. Concept maps for anything, at your fingertips.
+
+The same graph that powers your visualizations also works as an [**AI second brain**](#ai-knowledge-base). Everyone's spending months building knowledge bases in Notion and Obsidian. Who has time for that? sift-kg is the structured memory you build in 2 minutes instead of 2 years. Just point at your docs and your AI has a structured understanding of how everything connects.
+
+**[Live demos →](https://juanceresa.github.io/sift-kg/)** graphs generated entirely by sift-kg
+
+```bash
+pip install sift-kg
+
+sift init                           # create sift.yaml + .env.example
+sift extract ./documents/           # extract entities & relations
+sift build                          # build knowledge graph
+sift resolve                        # find duplicate entities
+sift review                         # approve/reject merges interactively
+sift apply-merges                   # apply your decisions
+sift narrate                        # generate narrative summary
+sift view                           # interactive graph in your browser
+sift export graphml                 # export to Gephi, yEd, Cytoscape, SQLite, etc.
+```
+
+## How It Works
+
+```
+Documents (PDF, DOCX, text, HTML, and 75+ formats)
+       ↓
+  Text Extraction (Kreuzberg, local) — with optional OCR (Tesseract, EasyOCR, PaddleOCR, or Google Cloud Vision)
+       ↓
+  Schema Discovery (LLM designs entity/relation types from your data — or use a predefined domain)
+       ↓
+  Entity & Relation Extraction (LLM, using discovered or predefined schema)
+       ↓
+  Knowledge Graph (NetworkX, JSON)
+       ↓
+  Entity Resolution (LLM proposes → you review)
+       ↓
+  Narrative Generation (LLM)
+       ↓
+  Interactive Viewer (browser) / Export (GraphML, GEXF, CSV, SQLite)
+```
+
+Every entity and relation links back to the source document and passage. You control what gets merged. The graph is yours.
+
+## Features
+
+- **Zero-config start** — point at a folder, get a knowledge graph. Or drop a `sift.yaml` in your project for persistent settings
+- **Any LLM provider** — OpenAI, Anthropic, Mistral, Ollama (local/private), or any LiteLLM-compatible provider
+- **Schema-free by default** — one LLM call samples your documents and designs a schema tailored to the corpus, saved as `discovered_domain.yaml` for reuse and editing. Or use a structured domain (`general`, `osint`, `academic`) for fixed schemas, or define your own in YAML
+- **Human-in-the-loop** — sift proposes entity merges, you approve or reject in an interactive terminal UI
+- **CLI search** — `sift search "SBF"` finds entities by name or alias, with optional relation and description output
+- **Interactive viewer** — explore your graph in-browser with community regions (colored zones showing graph structure), hover preview, focus mode (double-click to isolate neighborhoods), keyboard navigation (arrow keys to step through connections), trail breadcrumb (persistent path that tracks your exploration — trace back through every node you visited), search, type/community/relation toggles, source document filter, and degree filtering. Pre-filter with CLI flags: `--neighborhood`, `--top`, `--community`, `--source-doc`, `--min-confidence`
+- **Export anywhere** — GraphML (yEd, Cytoscape), GEXF (Gephi), SQLite, CSV, or native JSON for advanced analysis
+- **Narrative generation** — prose reports with relationship chains, timelines, and community-grouped entity profiles
+- **Source provenance** — every extraction links to the document and passage it came from
+- **Multilingual** — extracts from documents in any language, outputs a unified English knowledge graph. Proper names stay as-is, non-Latin scripts are romanized automatically
+- **75+ document formats** — PDF, DOCX, XLSX, PPTX, HTML, EPUB, images, and more via [Kreuzberg](https://kreuzberg-dev.github.io/kreuzberg/) extraction engine
+- **OCR for scanned PDFs** — local OCR via Tesseract (default), EasyOCR, or PaddleOCR (`--ocr` flag), with optional Google Cloud Vision fallback (`--ocr-backend gcv`)
+- **Budget controls** — set `--max-cost` to cap LLM spending
+- **Runs locally** — your documents stay on your machine
+
+## Use Cases
+
+- **Research & education** — map how theories, methods, and findings connect across a body of literature. Generate concept maps for courses, literature reviews, or self-study
+- **Business intelligence** — drop in competitor whitepapers, market reports, or internal docs and see the landscape
+- **Investigative work** — analyze FOIA releases, court filings, public records, and document leaks
+- **Legal review** — extract and connect entities across document collections
+- **Genealogy** — trace family relationships across vital records
+
+## AI Knowledge Base
+
+sift-kg generates structured knowledge that AI agents can operate from directly.
+
+Point sift at your documents, notes, or project files. The output — a JSON knowledge graph — gives any AI agent a persistent, structured understanding of how everything in your world connects. No manual organization, no tagging, no wiki links. The structure emerges from the content.
+
+```bash
+sift extract ./my-stuff/
+sift build
+sift topology          # structural overview (JSON, for agents)
+sift query "topic"     # entity neighborhood subgraph (JSON, for agents)
+sift search "X" --json # entity lookup (JSON, for agents)
+sift info --json       # project stats (JSON, for agents)
+```
+
+The graph persists across sessions and grows incrementally — extract new documents into the same output directory and rebuild. Entity deduplication ensures the graph stays coherent as it grows.
+
+**What this gives your agent:**
+- **Structure** — not just text chunks, but entities, relationships, communities, and how they connect
+- **Topology** — which knowledge clusters exist, what bridges them, what's isolated
+- **Durability** — the graph survives context window resets. Your agent stops starting from zero every session
+
+**Bundled agent skill:** sift-kg ships with a skill at `.agents/skills/sift-kg/SKILL.md` that teaches agents how to use the knowledge graph as persistent memory — session orientation, entity exploration, link-knowledge-islands reasoning, and grounded suggestion generation.
+
+## Bundled Domains
+
+sift-kg ships with specialized domains you can use out of the box:
+
+```bash
+sift domains                              # list available domains
+sift extract ./docs/ --domain-name osint  # use a bundled domain
+```
+
+Set a domain in `sift.yaml` so you don't need the flag every time:
+
+```yaml
+domain: academic
+```
+
+Works with bundled names (`schema-free`, `general`, `osint`, `academic`) or a path to a custom YAML file.
+
+| Domain | Focus | Key Entity Types | Key Relation Types |
+|--------|-------|------------------|--------------------|
+| `schema-free` | Auto-discovered from your data (default) | *(LLM designs per corpus)* | *(LLM designs per corpus)* |
+| `general` | General document analysis | PERSON, ORGANIZATION, LOCATION, EVENT, DOCUMENT | ASSOCIATED_WITH, MEMBER_OF, LOCATED_IN |
+| `osint` | Investigations & FOIA | SHELL_COMPANY, FINANCIAL_ACCOUNT | BENEFICIAL_OWNER_OF, TRANSACTED_WITH, SIGNATORY_OF |
+| `academic` | Literature review & topic mapping | CONCEPT, THEORY, METHOD, SYSTEM, FINDING, PHENOMENON, RESEARCHER, PUBLICATION, FIELD, DATASET | SUPPORTS, CONTRADICTS, EXTENDS, IMPLEMENTS, EXPLAINS, PROPOSED_BY, USES_METHOD, APPLIED_TO, INVESTIGATES |
+
+The **academic** domain maps the intellectual landscape of a research area — feed in papers and get a graph of how theories, methods, systems, findings, and concepts connect. Distinguishes abstract ideas (THEORY, METHOD) from concrete artifacts (SYSTEM — e.g. GPT-2, BERT, GLUE). Designed for literature reviews, topic mapping, and understanding where ideas agree, contradict, or build on each other.
+
+The **schema-free** domain (the default) runs a **schema discovery** step before extraction — one LLM call samples your documents and designs entity and relation types tailored to the corpus. The discovered schema is saved to `output/discovered_domain.yaml` and reused on subsequent runs, so types stay consistent across all chunks and documents. You can inspect, hand-edit, or copy the file as a starting point for a custom domain. Use `--force` to re-discover. Instead of forcing relationships into predefined categories like ASSOCIATED_WITH, it produces specific types like FUNDED, TESTIFIED_AGAINST, or ENROLLED_AT. Use a structured domain like `general` or `osint` when you want a fixed schema you define upfront.
+
+The **general** domain provides a fixed schema with PERSON, ORGANIZATION, LOCATION, EVENT, and DOCUMENT entity types plus common relation types. Useful when you want predictable, consistent types across documents.
+
+The **osint** domain adds entity types for shell companies, financial accounts, and offshore jurisdictions, plus relation types for tracing beneficial ownership and financial flows.
+
+Nothing gets merged without your approval — the LLM proposes, you verify. Every extraction links back to the source document and passage.
+
+See [`examples/transformers/`](examples/transformers/) for 12 foundational AI papers mapped as a concept graph (425 entities, ~$0.72), and [`examples/ftx/`](examples/ftx/) for the FTX collapse (431 entities from 9 articles). [**Explore the live demos**](https://juanceresa.github.io/sift-kg/) — no install, no API key.
+
+## Civic Table
+
+Looking for a hosted platform with forensic legal analysis and analyst verification?
+
+[**Civic Table**](https://github.com/juanceresa/forensic_analysis_platform) is a forensic intelligence platform built on the sift-kg pipeline. It adds a 4-tier verification system where analysts and JDs validate AI-extracted facts before they're treated as evidence, LaTeX dossier generation for legal submissions, and a web interface for sharing results with clients and families. Built for property restitution, investigative journalism, and any context where documentary provenance matters.
+
+sift-kg is the open-source CLI. Civic Table is the full platform — and where the output gets vetted by analysts and JDs before it carries evidentiary weight.
+
+## Installation
+
+Requires Python 3.11+.
+
+```bash
+pip install sift-kg
+```
+
+For OCR support (scanned PDFs, images):
+
+```bash
+# Local OCR — install Tesseract on your system
+brew install tesseract          # macOS
+sudo apt install tesseract-ocr  # Ubuntu/Debian
+
+# Then use: sift extract ./docs/ --ocr
+```
+
+For Google Cloud Vision OCR as an alternative backend (optional):
+
+```bash
+pip install sift-kg[ocr]
+# Then use: sift extract ./docs/ --ocr --ocr-backend gcv
+```
+
+For semantic clustering during entity resolution (optional, ~2GB for PyTorch):
+
+```bash
+pip install sift-kg[embeddings]
+```
+
+For development:
+
+```bash
+git clone https://github.com/juanceresa/sift-kg.git
+cd sift-kg
+pip install -e ".[dev]"
+```
+
+## Quick Start
+
+### 1. Initialize and configure
+
+```bash
+sift init                     # creates sift.yaml + .env.example
+cp .env.example .env          # copy and add your API key
+```
+
+`sift init` generates a `sift.yaml` project config so you don't need flags on every command:
+
+```yaml
+# sift.yaml
+domain: domain.yaml           # or a bundled name like "osint"
+model: openai/gpt-4o-mini
+ocr: true                     # enable OCR for scanned PDFs
+# extraction:
+#   backend: kreuzberg         # kreuzberg (default, 75+ formats) | pdfplumber
+#   ocr_backend: tesseract     # tesseract | easyocr | paddleocr | gcv
+#   ocr_language: eng
+```
+
+Set your API key in `.env`:
+```
+SIFT_OPENAI_API_KEY=sk-...
+```
+
+Or use Anthropic, Mistral, Ollama, or any LiteLLM provider:
+```
+SIFT_ANTHROPIC_API_KEY=sk-ant-...
+SIFT_MISTRAL_API_KEY=...
+```
+
+Settings priority: CLI flags > env vars > `.env` > `sift.yaml` > defaults. You can override anything from `sift.yaml` with a flag on any command.
+
+### 2. Extract entities and relations
+
+```bash
+sift extract ./my-documents/
+sift extract ./my-documents/ --ocr                  # local OCR via Tesseract
+sift extract ./my-documents/ --ocr --ocr-backend gcv  # Google Cloud Vision OCR
+sift extract ./my-documents/ --extractor pdfplumber   # legacy pdfplumber backend
+```
+
+Reads 75+ document formats — PDFs, DOCX, XLSX, PPTX, HTML, EPUB, images, and more. Extracts entities and relations using your configured LLM. Results saved as JSON in `output/extractions/`.
+
+The `--ocr` flag enables local OCR via Tesseract for scanned PDFs — no API keys or cloud services needed. You can switch OCR engines with `--ocr-backend`:
+
+```bash
+sift extract ./docs/ --ocr                          # Tesseract (default, local)
+sift extract ./docs/ --ocr --ocr-backend easyocr    # EasyOCR (local)
+sift extract ./docs/ --ocr --ocr-backend paddleocr  # PaddleOCR (local)
+sift extract ./docs/ --ocr --ocr-backend gcv        # Google Cloud Vision (requires credentials)
+```
+
+It autodetects which PDFs need OCR — text-rich PDFs use standard extraction, only near-empty pages fall back to OCR. Safe for mixed folders. Without `--ocr`, sift will warn if a PDF appears to be scanned.
+
+You can also switch the extraction backend entirely with `--extractor pdfplumber` for the legacy pdfplumber backend (PDF/DOCX/TXT/HTML only).
+
+### 3. Build the knowledge graph
+
+```bash
+sift build
+```
+
+Constructs a NetworkX graph from all extractions. Automatically deduplicates near-identical entity names (plurals, Unicode variants, case differences) before they become graph nodes. Fixes reversed edge directions when the LLM swaps source/target types vs. the domain schema. Flags low-confidence relations for review. Saves to `output/graph_data.json`.
+
+### 4. Resolve duplicate entities
+
+See [Entity Resolution Workflow](#entity-resolution-workflow) below for the full guide — especially important for genealogy, legal, and investigative use cases where accuracy matters.
+
+### 5. Explore and export
+
+**Interactive viewer** — explore your concept map in the browser:
+
+```bash
+sift view                                              # full graph
+sift view --neighborhood "Palantir Technologies"       # 1-hop ego graph around an entity
+sift view --neighborhood "Palantir" --depth 3          # 3-hop neighborhood
+sift view --top 10                                     # top 10 hubs + their neighbors
+sift view --community "Community 1"                    # focus on a specific community
+sift view --source-doc palantir_nsa_surveillance       # entities from one document
+sift view --min-confidence 0.8                         # hide low-confidence nodes/edges
+```
+
+Opens a force-directed graph in your browser. The overview shows **community regions** — colored convex hulls grouping related entities — so you can see graph structure at a glance without label clutter. Hover any node to preview its name and connections. Includes search, type/community/relation toggles, source document filter, degree filter, and a detail sidebar.
+
+Pre-filter flags (`--top`, `--neighborhood`, `--source-doc`, `--min-confidence`) reduce the graph before rendering. `--community` pre-selects a community in the sidebar. `--neighborhood` accepts entity IDs (`person:alice`) or display names (case-insensitive).
+
+**Focus mode:** Double-click any entity to isolate its neighborhood. Use arrow keys to step through connections one by one — each pair is shown in isolation with labeled edges. Press Enter/Right to shift focus to a neighbor, Backspace/Left to go back along your path, Escape to exit. Your exploration is tracked as a **trail breadcrumb** in the sidebar — a persistent path showing every node you've visited and the relations between them. Trail edges stay highlighted on the canvas so you can see your path through the graph. This is the intended way to explore dense graphs — zoom in on what matters, trace connections, read the evidence.
+
+**CLI search** — query entities directly from the terminal:
+
+```bash
+sift search "Sam Bankman"          # search by name
+sift search "SBF"                  # search by alias
+sift search "Caroline" -r          # show relations
+sift search "FTX" -d -t ORGANIZATION  # descriptions + type filter
+```
+
+**Static exports** — for analysis tools where you want custom layout, filtering, or styling:
+
+```bash
+sift export graphml           # → output/graph.graphml (Gephi, yEd, Cytoscape)
+sift export gexf              # → output/graph.gexf (Gephi native)
+sift export sqlite            # → output/graph.sqlite (SQL queries, DuckDB, Datasette)
+sift export csv               # → output/csv/entities.csv + relations.csv
+sift export json              # → output/graph.json
+```
+
+Use GraphML/GEXF when you want to control node sizing, edge weighting, custom color schemes, or apply graph algorithms (centrality, community detection) in dedicated tools. SQLite is useful for ad-hoc SQL queries, [Datasette](https://datasette.io/) publishing, or loading into DuckDB.
+
+### 6. Generate narrative
+
+```bash
+sift narrate
+sift narrate --communities-only   # regenerate community labels only (~$0.01)
+```
+
+Produces `output/narrative.md` — a prose report with an overview, key relationship chains between top entities, a timeline (when dates exist in the data), and entity profiles grouped by thematic community (discovered via Louvain community detection). Entity descriptions are written in active voice with specific actions, not role summaries.
+
+## Domain Configuration
+
+sift-kg ships with four bundled domains (see [Bundled Domains](#bundled-domains) above for details). The default is `schema-free`.
+
+Use a bundled domain:
+```bash
+sift extract ./docs/ --domain-name osint
+```
+
+Or create your own `domain.yaml`:
+```yaml
+name: My Domain
+fallback_relation: RELATED_TO          # optional — catch-all for relations that don't fit defined types
+entity_types:
+  PERSON:
+    description: People and individuals
+    extraction_hints:
+      - Look for full names with titles
+  COMPANY:
+    description: Business entities
+  DEPARTMENT:
+    description: Named departments within a company
+    canonical_names:              # closed vocabulary — only these values allowed
+      - Engineering
+      - Sales
+      - Legal
+      - Marketing
+    canonical_fallback_type: ORGANIZATION  # non-canonical names get retyped
+relation_types:
+  EMPLOYED_BY:
+    description: Employment relationship
+    source_types: [PERSON]
+    target_types: [COMPANY]
+  OWNS:
+    description: Ownership relationship
+    symmetric: false
+    review_required: true
+  RELATED_TO:                            # define the fallback type if you use one
+    description: General relationship
+```
+
+**Schema enforcement:** Entity types and relation types defined in your domain are treated as a closed set — the LLM is instructed to use only these types and will not invent new ones. If `fallback_relation` is set, relationships that don't fit any defined type are mapped to the fallback. If omitted, the LLM uses the closest matching defined type with lower confidence. If you see many relations landing on your fallback type, your schema is likely missing a relation type that the data needs — add it and re-extract.
+
+Entity types with `canonical_names` enforce a closed vocabulary. The allowed names are injected into the LLM extraction prompt so it outputs exact matches. As a safety net, any extracted name not in the list gets retyped to `canonical_fallback_type` during graph building (or kept as-is if no fallback is set). Useful for controlled taxonomies — departments, jurisdictions, predefined classifications.
+
+```bash
+sift extract ./docs/ --domain path/to/domain.yaml
+```
+
+## Library API
+
+Use sift-kg from Python — Jupyter notebooks, scripts, web apps:
+
+```python
+from sift_kg import load_domain, run_extract, run_build, run_narrate, run_resolve, run_export, run_view
+from sift_kg import KnowledgeGraph
+from pathlib import Path
+
+domain = load_domain()  # or load_domain(bundled_name="osint")
+
+# Extract — supports OCR, backend selection, concurrency
+results = run_extract(
+    Path("./docs"), "openai/gpt-4o-mini", domain, Path("./output"),
+    ocr=True, ocr_backend="tesseract",       # enable OCR for scanned PDFs
+    extractor="kreuzberg",                     # or "pdfplumber"
+    concurrency=4, chunk_size=10000,
+)
+
+# Build graph
+kg = run_build(Path("./output"), domain)
+print(f"{kg.entity_count} entities, {kg.relation_count} relations")
+
+# Resolve duplicates — with optional semantic clustering
+merges = run_resolve(Path("./output"), "openai/gpt-4o-mini", domain=domain, use_embeddings=True)
+
+# Export — json, graphml, gexf, csv, sqlite
+run_export(Path("./output"), "sqlite")
+
+# Narrate — or just regenerate community labels cheaply
+run_narrate(Path("./output"), "openai/gpt-4o-mini", communities_only=True)
+
+# View — with optional pre-filters
+run_view(Path("./output"))                                          # full graph
+run_view(Path("./output"), neighborhood="person:alice", depth=2)    # ego graph
+run_view(Path("./output"), top_n=10)                                # top hubs
+
+# Or run the full pipeline (extract → build → narrate)
+from sift_kg import run_pipeline
+run_pipeline(Path("./docs"), "openai/gpt-4o-mini", domain, Path("./output"))
+```
+
+## Project Structure
+
+After running the pipeline, your output directory contains:
+
+```
+output/
+├── extractions/               # Per-document extraction JSON
+│   ├── document1.json
+│   └── document2.json
+├── discovered_domain.yaml     # Auto-discovered schema (schema-free mode)
+├── graph_data.json            # Knowledge graph (native format)
+├── merge_proposals.yaml       # Entity merge proposals (DRAFT/CONFIRMED/REJECTED)
+├── relation_review.yaml       # Flagged relations for review
+├── narrative.md               # Generated narrative summary
+├── entity_descriptions.json   # Entity descriptions (loaded by viewer)
+├── communities.json           # Community assignments (shared by narrate + viewer)
+├── graph.html                 # Interactive graph visualization
+├── graph.graphml              # GraphML export (if exported)
+├── graph.gexf                 # GEXF export (if exported)
+├── graph.sqlite               # SQLite export (if exported)
+└── csv/                       # CSV export (if exported)
+    ├── entities.csv
+    └── relations.csv
+```
+
+## Entity Resolution Workflow
+
+When you're building a knowledge graph from family records, legal filings, or any documents where accuracy matters, you want full control over which entities get merged. sift-kg never merges anything without your approval.
+
+The workflow has three layers, each catching different kinds of duplicates:
+
+### Layer 1: Automatic Pre-Dedup (during `sift build`)
+
+Before entities become graph nodes, sift deterministically collapses names that are obviously the same. No LLM involved, no cost, no review needed:
+
+- **Unicode normalization** — "Jose Garcia" and "Jose Garcia" become one node
+- **Title stripping** — "Detective Joe Recarey" and "Joe Recarey" merge (strips ~35 common prefixes: Dr., Mr., Judge, Senator, etc.)
+- **Singularization** — "Companies" and "Company" merge
+- **Fuzzy string matching** — [SemHash](https://github.com/MinishLab/semhash) at 0.95 threshold catches near-identical strings like "MacAulay" vs "Mac Aulay"
+
+This happens automatically every time you run `sift build`. These are the trivial cases — spelling variants that would clutter your graph without adding information.
+
+### Layer 2: LLM Proposes Merges (during `sift resolve`)
+
+The LLM sees batches of entities (all types except DOCUMENT) and identifies ones that likely refer to the same real-world thing. It also detects cross-type duplicates (same name, different entity type) and proposes variant relationships (EXTENDS) when it finds parent/child patterns. Results go to `merge_proposals.yaml` (entity merges) and `relation_review.yaml` (variant relations), all starting as `DRAFT`:
+
+```bash
+sift resolve                  # uses domain from sift.yaml
+sift resolve --domain osint   # or specify explicitly
+```
+
+If you have a domain configured, the LLM uses that context to make better judgments about entity names specific to your field.
+
+This generates proposals like:
+
+```yaml
+proposals:
+- canonical_id: person:samuel_benjamin_bankman_fried
+  canonical_name: Samuel Benjamin Bankman-Fried
+  entity_type: PERSON
+  status: DRAFT                    # ← you decide
+  members:
+  - id: person:bankman_fried
+    name: Bankman-Fried
+    confidence: 0.99
+  reason: Same person referenced with full name vs. surname only.
+
+- canonical_id: person:stephen_curry
+  canonical_name: Stephen Curry
+  entity_type: PERSON
+  status: DRAFT                    # ← you decide
+  members:
+  - id: person:steph_curry
+    name: Steph Curry
+    confidence: 0.99
+  reason: Same basketball player referenced with nickname 'Steph' and full name 'Stephen'.
+```
+
+**Nothing is merged yet.** The LLM is proposing, not deciding.
+
+### Layer 3: You Review and Decide
+
+You have two options for reviewing proposals:
+
+**Option A: Interactive terminal review**
+
+```bash
+sift review
+```
+
+Walks through each `DRAFT` proposal one by one. For each, you see the canonical entity, the proposed merge members, the LLM's confidence and reasoning. You approve, reject, or skip.
+
+High-confidence proposals (>0.85 by default) are auto-approved, and low-confidence relations (<=0.5 by default) are auto-rejected:
+```bash
+sift review                        # uses defaults: --auto-approve 0.85, --auto-reject 0.5
+sift review --auto-approve 0.90    # raise the auto-approve threshold
+sift review --auto-reject 0.3      # lower the auto-reject threshold
+sift review --auto-approve 1.0     # disable auto-approve, review everything manually
+```
+
+**Option B: Edit the YAML directly**
+
+Open `output/merge_proposals.yaml` in any text editor. Change `status: DRAFT` to `CONFIRMED` or `REJECTED`:
+
+```yaml
+- canonical_id: person:stephen_curry
+  canonical_name: Stephen Curry
+  entity_type: PERSON
+  status: CONFIRMED                # ← approve this merge
+  members:
+  - id: person:steph_curry
+    name: Steph Curry
+    confidence: 0.99
+  reason: Same basketball player...
+
+- canonical_id: person:winklevoss_twins
+  canonical_name: Winklevoss twins
+  entity_type: PERSON
+  status: REJECTED                 # ← these are distinct people, don't merge
+  members:
+  - id: person:cameron_winklevoss
+    name: Cameron Winklevoss
+    confidence: 0.95
+  reason: ...
+```
+
+**For high-accuracy use cases** (genealogy, legal review), we recommend editing the YAML directly so you can study each proposal carefully. The file is designed to be human-readable.
+
+### Layer 3b: Relation Review
+
+During `sift build`, relations below the confidence threshold (default 0.7) or of types marked `review_required` in your domain config get flagged in `output/relation_review.yaml`:
+
+```yaml
+review_threshold: 0.7
+relations:
+- source_name: Alice Smith
+  target_name: Acme Corp
+  relation_type: WORKS_FOR
+  confidence: 0.45
+  evidence: "Alice mentioned she used to work near the Acme building."
+  status: DRAFT                    # ← you decide: CONFIRMED or REJECTED
+  flag_reason: Low confidence (0.45 < 0.7)
+```
+
+Same workflow: review with `sift review` or edit the YAML, then apply.
+
+### Layer 4: Apply Your Decisions
+
+Once you've reviewed everything:
+
+```bash
+sift apply-merges
+```
+
+This does three things:
+1. **Confirmed entity merges** — member entities are absorbed into the canonical entity. All their relations are rewired. Source documents are combined. The member nodes are removed.
+2. **Rejected relations** — removed from the graph entirely.
+3. **DRAFT proposals** — left untouched. You can come back to them later.
+
+The graph is saved back to `output/graph_data.json`. You can re-export, narrate, or visualize the cleaned graph.
+
+### Iterating
+
+Entity resolution isn't always one-pass. After merging, new duplicates may become apparent. You can re-run:
+
+```bash
+sift resolve                  # find new duplicates in the cleaned graph
+sift review                   # review the new proposals
+sift apply-merges             # apply again
+```
+
+Each run is additive — previous `CONFIRMED`/`REJECTED` decisions in `merge_proposals.yaml` are preserved.
+
+### Recommended Workflow by Use Case
+
+| Use Case | Suggested Approach |
+|---|---|
+| **Quick exploration** | `sift review --auto-approve 0.85` — approve high-confidence, review the rest |
+| **Genealogy / family records** | Edit YAML manually, `--auto-approve 1.0` — review every single merge |
+| **Legal / investigative** | `sift resolve --embeddings`, edit YAML manually, use `sift view` to inspect between rounds |
+| **Large corpus (1000+ entities)** | `sift resolve --embeddings` for better batching, then interactive review |
+
+## Deduplication Internals
+
+The pre-dedup and LLM batching techniques are inspired by [KGGen](https://github.com/stochastic-sisyphus/KGGen) (NeurIPS 2025) by [@stochastic-sisyphus](https://github.com/stochastic-sisyphus). KGGen uses SemHash for deterministic entity deduplication and embedding-based clustering for grouping entities before LLM comparison. sift-kg adapts these into its human-in-the-loop review workflow.
+
+### Embedding-Based Clustering (optional)
+
+By default, `sift resolve` sorts entities alphabetically and splits them into overlapping batches for LLM comparison. This works well when duplicates have similar spelling — but "Robert Smith" (R) and "Bob Smith" (B) end up in different batches and never get compared.
+
+```bash
+pip install sift-kg[embeddings]    # sentence-transformers + scikit-learn (~2GB, pulls PyTorch)
+sift resolve --embeddings
+```
+
+This replaces alphabetical batching with KMeans clustering on sentence embeddings (all-MiniLM-L6-v2). Semantically similar names cluster together regardless of spelling.
+
+| | Default (alphabetical) | `--embeddings` |
+|---|---|---|
+| Install size | Included | ~2GB (PyTorch) |
+| First-run overhead | None | ~90MB model download |
+| Per-run overhead | Sorting only | Encoding (<1s for hundreds of entities) |
+| Cross-alphabet duplicates | Missed if in different batches | Caught |
+| Small graphs (<100/type) | Same result | Same result |
+
+Falls back to alphabetical batching if dependencies aren't installed or clustering fails.
+
+## License
+
+MIT
