@@ -28,6 +28,8 @@ _YAML_TO_FIELD = {
     "model": "default_model",
     "output": "output_dir",
     "ocr": "ocr",
+    "schema_version": "schema_version",
+    "snapshot_retention": "snapshot_retention",
 }
 
 # Nested extraction block keys
@@ -35,6 +37,11 @@ _EXTRACTION_YAML_TO_FIELD = {
     "backend": "extraction_backend",
     "ocr_backend": "ocr_backend",
     "ocr_language": "ocr_language",
+}
+
+# Nested resolve block keys
+_RESOLVE_YAML_TO_FIELD = {
+    "auto_approve_threshold": "auto_approve_threshold",
 }
 
 
@@ -65,6 +72,13 @@ class _ProjectYamlSource(PydanticBaseSettingsSource):
             # extraction.ocr overrides top-level ocr
             if "ocr" in extraction:
                 result["ocr"] = extraction["ocr"]
+
+        # Handle nested resolve: block
+        resolve_config = raw.get("resolve", {})
+        if isinstance(resolve_config, dict):
+            for yaml_key, field_name in _RESOLVE_YAML_TO_FIELD.items():
+                if yaml_key in resolve_config:
+                    result[field_name] = resolve_config[yaml_key]
 
         return result
 
@@ -166,6 +180,24 @@ class SiftConfig(BaseSettings):
         description="OCR language code (ISO 639-3, e.g. eng, fra, deu)",
     )
 
+    schema_version: str | None = Field(
+        default=None,
+        description="Schema version identifier for incremental schema discovery",
+    )
+
+    auto_approve_threshold: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Auto-approve merge proposals with confidence >= this threshold. Set to null to disable.",
+    )
+
+    snapshot_retention: int = Field(
+        default=50,
+        ge=1,
+        description="Number of graph snapshots to retain before rolling deletion",
+    )
+
     @field_validator("extraction_backend")
     @classmethod
     def validate_extraction_backend(cls, v: str) -> str:
@@ -261,3 +293,27 @@ class SiftConfig(BaseSettings):
         # Ollama models run locally - no API key needed
         if model.startswith("ollama/"):
             pass
+
+    @staticmethod
+    def get_project_yaml_info() -> dict[str, str | int | None]:
+        """Get schema_version and file size from raw sift.yaml for integrity checks.
+
+        Returns:
+            Dict with 'schema_version' (str or None) and 'file_size' (int or None).
+            Both None if sift.yaml doesn't exist.
+        """
+        project_file = Path("sift.yaml")
+        if not project_file.exists():
+            return {"schema_version": None, "file_size": None}
+
+        try:
+            raw = yaml.safe_load(project_file.read_text()) or {}
+            file_size = project_file.stat().st_size
+            schema_version = raw.get("schema_version")
+            return {
+                "schema_version": str(schema_version) if schema_version is not None else None,
+                "file_size": file_size,
+            }
+        except Exception as e:
+            logger.warning(f"Failed to read sift.yaml for version check: {e}")
+            return {"schema_version": None, "file_size": None}

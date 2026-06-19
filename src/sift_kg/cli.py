@@ -20,6 +20,54 @@ app = typer.Typer(
 console = Console()
 
 
+@app.callback()
+def global_options(
+    ctx: typer.Context,
+    diff_snapshots: tuple[str, str] | None = typer.Option(
+        None,
+        "--diff-snapshots",
+        help="Compute diff between two snapshots (A B). Outputs markdown to stdout.",
+    ),
+    replay_snapshot: str | None = typer.Option(
+        None,
+        "--replay-snapshot",
+        help="Replay a snapshot to regenerate narrative without re-extraction.",
+    ),
+    output: str | None = typer.Option(
+        None, "-o", help="Output directory (used by snapshot operations)",
+    ),
+) -> None:
+    """Global options for sift CLI."""
+    if diff_snapshots is not None:
+        config = SiftConfig()
+        output_dir = Path(output) if output else config.output_dir
+
+        from sift_kg.graph.snapshots import diff_snapshots
+
+        try:
+            report = diff_snapshots(output_dir, diff_snapshots[0], diff_snapshots[1])
+            print(report)
+            raise typer.Exit(0)
+        except ValueError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            raise typer.Exit(1) from None
+
+    if replay_snapshot is not None:
+        config = SiftConfig()
+        output_dir = Path(output) if output else config.output_dir
+
+        from sift_kg.graph.snapshots import replay_snapshot
+
+        try:
+            narrative_path = replay_snapshot(output_dir, replay_snapshot)
+            console.print(f"[green]Snapshot replay complete![/green]")
+            console.print(f"  Narrative: {narrative_path}")
+            raise typer.Exit(0)
+        except ValueError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            raise typer.Exit(1) from None
+
+
 def _load_domain(config: SiftConfig, domain_name: str = "schema-free"):
     """Load domain config from user path or bundled name.
 
@@ -138,13 +186,103 @@ def extract(
         console.print(f"[yellow]No supported documents found in {directory}[/yellow]")
         raise typer.Exit(0)
 
+    # Incremental schema discovery workflow for schema-free mode
+    docs_to_extract = docs
+    incremental_skip_discovery = False
+    incremental_merge_mode = False
+
+    if domain_config.schema_free and not force:
+        from sift_kg.config import SiftConfig
+        from sift_kg.domains.discovery import (
+            discover_domain,
+            load_discovered_domain,
+        )
+        from sift_kg.domains.incremental import (
+            SchemaCheckResult,
+            add_to_unassigned_bucket,
+            check_schema_version,
+            merge_discovered_schemas,
+            save_merged_schema,
+        )
+
+        version_check = check_schema_version(output_dir)
+        discovered_path = output_dir / "discovered_domain.yaml"
+
+        if version_check.is_match and discovered_path.exists():
+            cached = load_discovered_domain(discovered_path)
+            if cached is not None:
+                domain_config = cached
+                incremental_skip_discovery = True
+                console.print(
+                    f"[cyan]Incremental build:[/cyan] schema_version match "
+                    f"({version_check.message}), reusing cached schema"
+                )
+                console.print(
+                    f"  Entity types: {len(domain_config.entity_types)}, "
+                    f"Relation types: {len(domain_config.relation_types)}"
+                )
+                console.print()
+
+        elif version_check.needs_confirmation and discovered_path.exists():
+            cached = load_discovered_domain(discovered_path)
+            if cached is not None:
+                console.print()
+                console.print("[yellow]⚠️  Schema change detected![/yellow]")
+                console.print(f"  {version_check.message}")
+                console.print()
+                console.print(
+                    "Would you like to re-run schema discovery and "
+                    "incrementally merge new types?"
+                )
+                console.print(
+                    "  [green]Yes[/green]: Discover new types and merge with existing schema"
+                )
+                console.print(
+                    "  [red]No[/red]: Keep existing schema, new documents go to unassigned bucket"
+                )
+
+                if typer.confirm("Re-run schema discovery?", default=True):
+                    incremental_merge_mode = True
+                    console.print()
+                    console.print(
+                        "[cyan]Incremental merge mode:[/cyan] "
+                        "will merge newly discovered types with existing schema"
+                    )
+                    console.print()
+                else:
+                    console.print()
+                    console.print(
+                        "[yellow]Keeping existing schema.[/yellow] "
+                        "New documents will be marked as unassigned."
+                    )
+
+                    unassigned_ids = [doc.stem for doc in docs]
+                    add_to_unassigned_bucket(
+                        output_dir,
+                        unassigned_ids,
+                        reason=version_check.message,
+                    )
+
+                    console.print(
+                        f"  [yellow]Marked {len(unassigned_ids)} documents as unassigned[/yellow]"
+                    )
+                    console.print(
+                        "  You can reprocess them later after confirming schema changes."
+                    )
+                    console.print()
+                    docs_to_extract = []
+
     domain_label = domain_config.name
     if domain_config.schema_free:
         domain_label += " [dim](schema-free)[/dim]"
+    if incremental_skip_discovery:
+        domain_label += " [green](cached)[/green]"
+    if incremental_merge_mode:
+        domain_label += " [cyan](incremental merge)[/cyan]"
     console.print(f"[cyan]Domain:[/cyan] {domain_label}")
     console.print(f"[cyan]Model:[/cyan] {effective_model}")
     console.print(f"[cyan]Extractor:[/cyan] {effective_backend}")
-    console.print(f"[cyan]Documents:[/cyan] {len(docs)}")
+    console.print(f"[cyan]Documents:[/cyan] {len(docs_to_extract)}")
     if effective_ocr:
         ocr_label = (
             "Google Cloud Vision" if effective_ocr_backend == "gcv" else effective_ocr_backend
@@ -154,13 +292,64 @@ def extract(
         console.print(f"[cyan]Budget:[/cyan] ${max_cost:.2f}")
     console.print()
 
+    if not docs_to_extract:
+        console.print("[yellow]No documents to extract (all marked as unassigned).[/yellow]")
+        console.print()
+        console.print("Next: [cyan]sift build[/cyan] to construct the knowledge graph")
+        raise typer.Exit(0)
+
     # Set up LLM client and run extraction
     from sift_kg.extract.extractor import extract_all
     from sift_kg.extract.llm_client import LLMClient
 
     llm = LLMClient(model=effective_model, rpm=rpm)
+
+    if incremental_merge_mode and cached is not None:
+        import asyncio
+        from sift_kg.ingest.reader import read_document
+        from sift_kg.ingest.chunker import chunk_text
+
+        try:
+            first_doc = docs_to_extract[0]
+            first_text = read_document(
+                first_doc,
+                ocr=effective_ocr,
+                backend=effective_backend,
+                ocr_backend=effective_ocr_backend,
+                ocr_language=effective_ocr_language,
+            )
+            chunks = chunk_text(first_text, chunk_size=chunk_size)
+            samples = [chunks[0].text[:3000]]
+
+            new_domain = asyncio.run(discover_domain(samples, llm, domain_config.system_context or ""))
+            merged_domain = merge_discovered_schemas(cached, new_domain)
+
+            yaml_info = SiftConfig.get_project_yaml_info()
+            save_merged_schema(
+                merged_domain,
+                output_dir,
+                yaml_info["schema_version"],
+                yaml_info["file_size"],
+            )
+            domain_config = merged_domain
+
+            new_entity_types = len(merged_domain.entity_types) - len(cached.entity_types)
+            new_relation_types = len(merged_domain.relation_types) - len(cached.relation_types)
+
+            console.print(
+                f"[cyan]Incremental merge complete:[/cyan] "
+                f"+{new_entity_types} entity types, +{new_relation_types} relation types"
+            )
+            console.print()
+        except Exception as e:
+            console.print(
+                f"[yellow]Incremental discovery failed, falling back to existing schema: {e}[/yellow]"
+            )
+            console.print()
+            domain_config = cached
+
     results = extract_all(
-        docs,
+        docs_to_extract,
         llm,
         domain_config,
         output_dir,
@@ -287,6 +476,12 @@ def build(
     graph_path = output_dir / "graph_data.json"
     kg.save(graph_path)
 
+    # Create time-based snapshot
+    from sift_kg.graph.snapshots import create_snapshot
+
+    snapshot_path = create_snapshot(kg, output_dir)
+    console.print(f"  Snapshot: {snapshot_path.name}")
+
     # Detect communities (Louvain, no LLM needed)
     from sift_kg.graph.communities import detect_communities, save_communities
 
@@ -338,10 +533,18 @@ def resolve(
         "--embeddings",
         help="Use semantic clustering (requires: pip install sift-kg[embeddings])",
     ),
+    auto_approve_threshold: float | None = typer.Option(
+        None,
+        "--auto-approve-threshold",
+        min=0.0,
+        max=1.0,
+        help="Auto-approve merges with confidence >= this threshold (0.0-1.0). Overrides sift.yaml.",
+    ),
     output: str | None = typer.Option(None, "-o", help="Output directory"),
     verbose: bool = typer.Option(False, "-v", "--verbose", help="Verbose logging"),
 ) -> None:
     """Find duplicate entities using LLM-based resolution."""
+    import sys
     _setup_logging(verbose)
     config = SiftConfig()
     effective_model = model or config.default_model
@@ -352,6 +555,10 @@ def resolve(
     except ValueError as e:
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1) from None
+
+    effective_threshold = auto_approve_threshold
+    if effective_threshold is None:
+        effective_threshold = config.auto_approve_threshold
 
     # Load domain for system context
     if domain:
@@ -368,11 +575,33 @@ def resolve(
     from sift_kg.graph.knowledge_graph import KnowledgeGraph
     from sift_kg.resolve.io import read_relation_review, write_proposals, write_relation_review
     from sift_kg.resolve.models import RelationReviewFile
-    from sift_kg.resolve.resolver import find_merge_candidates
+    from sift_kg.resolve.resolver import find_merge_candidates, apply_auto_approve
 
     kg = KnowledgeGraph.load(graph_path)
+
+    existing_auto_merged = 0
+    graph_metadata = kg.export().get("metadata", {})
+    auto_approve_stats = graph_metadata.get("auto_approve_stats", {})
+    if auto_approve_stats:
+        existing_auto_merged = auto_approve_stats.get("total_auto_approved", 0)
+
+    if existing_auto_merged > 0 and effective_threshold is None:
+        print(
+            f"WARNING: History {existing_auto_merged} auto-merged records will be retained. "
+            f"auto_approve is currently disabled.",
+            file=sys.stderr,
+        )
+
     console.print(f"[cyan]Domain:[/cyan] {domain_config.name}")
     console.print(f"[cyan]Graph:[/cyan] {kg.entity_count} entities, {kg.relation_count} relations")
+    if effective_threshold is not None:
+        console.print(
+            f"[cyan]Auto-approve:[/cyan] enabled (threshold >= {effective_threshold:.2f})"
+        )
+    if existing_auto_merged > 0:
+        console.print(
+            f"[cyan]History:[/cyan] {existing_auto_merged} previously auto-merged records"
+        )
 
     llm = LLMClient(model=effective_model, rpm=rpm)
     merge_file, variant_relations = find_merge_candidates(
@@ -383,9 +612,68 @@ def resolve(
         system_context=system_context,
     )
 
+    auto_approved_count = 0
+    if effective_threshold is not None and merge_file.proposals:
+        merge_file, pending_file, auto_approved_count = apply_auto_approve(
+            merge_file, effective_threshold, output_dir
+        )
+
+        if auto_approved_count > 0:
+            console.print()
+            console.print(
+                f"[green]Auto-approved {auto_approved_count} merge proposals "
+                f"(confidence >= {effective_threshold:.2f})[/green]"
+            )
+            if pending_file.proposals:
+                console.print(
+                    f"[yellow]Remaining {len(pending_file.proposals)} proposals "
+                    f"written to merges_pending.json for review[/yellow]"
+                )
+
     if not merge_file.proposals and not variant_relations:
         console.print("[green]No duplicates or variant relationships found![/green]")
         return
+
+    # Apply auto-approved merges immediately to the graph
+    if auto_approved_count > 0:
+        from sift_kg.resolve.engine import apply_merges
+
+        merge_stats = apply_merges(kg, merge_file)
+        if merge_stats.get("merges_applied", 0) > 0:
+            # Update graph metadata with auto-approve stats
+            total_proposals = len(merge_file.proposals)
+            auto_approve_ratio = auto_approved_count / total_proposals if total_proposals > 0 else 0
+
+            export_data = kg.export()
+            existing_metadata = export_data.get("metadata", {})
+            existing_stats = existing_metadata.get("auto_approve_stats", {})
+            prev_total = existing_stats.get("total_auto_approved", 0)
+
+            new_stats = {
+                "threshold": effective_threshold,
+                "last_run_auto_approved": auto_approved_count,
+                "last_run_total_proposals": total_proposals,
+                "last_run_auto_approve_ratio": auto_approve_ratio,
+                "total_auto_approved": prev_total + auto_approved_count,
+                "last_run_at": __import__("datetime").datetime.now().isoformat(),
+            }
+            existing_metadata["auto_approve_stats"] = new_stats
+
+            # Re-save graph with updated metadata
+            graph_data = {
+                "metadata": existing_metadata,
+                "nodes": export_data["nodes"],
+                "links": export_data["links"],
+            }
+            import json
+            graph_path.write_text(json.dumps(graph_data, indent=2, default=str))
+            console.print(
+                f"[green]Applied {merge_stats['merges_applied']} auto-approved merges to graph[/green]"
+            )
+            console.print(
+                f"  Auto-approve ratio: {auto_approve_ratio:.1%} "
+                f"({auto_approved_count}/{total_proposals})"
+            )
 
     if merge_file.proposals:
         proposals_path = output_dir / "merge_proposals.yaml"
@@ -410,7 +698,16 @@ def resolve(
 
     console.print()
     if merge_file.proposals:
-        console.print(f"[green]Found {len(merge_file.proposals)} merge proposals[/green]")
+        remaining_draft = sum(1 for p in merge_file.proposals if p.status == "DRAFT")
+        confirmed = sum(1 for p in merge_file.proposals if p.status == "CONFIRMED")
+        if confirmed > 0:
+            console.print(
+                f"[green]Confirmed merges: {confirmed} (auto-approved)[/green]"
+            )
+        if remaining_draft > 0:
+            console.print(
+                f"[yellow]Pending review: {remaining_draft} merge proposals[/yellow]"
+            )
     if variant_relations:
         console.print(
             f"[green]Found {len(variant_relations)} variant relationships (EXTENDS)[/green]"
@@ -418,8 +715,11 @@ def resolve(
     console.print(f"  Cost: ${llm.total_cost_usd:.4f}")
     console.print(f"  Output: {output_dir}")
     console.print()
-    console.print("Next: [cyan]sift review[/cyan] to approve/reject merges and relations")
-    console.print("  Then: [cyan]sift apply-merges[/cyan]")
+    if any(p.status == "DRAFT" for p in merge_file.proposals) or variant_relations:
+        console.print("Next: [cyan]sift review[/cyan] to approve/reject remaining merges and relations")
+        console.print("  Then: [cyan]sift apply-merges[/cyan]")
+    else:
+        console.print("Next: [cyan]sift narrate[/cyan] to generate narrative summary")
 
 
 @app.command(name="apply-merges")
@@ -801,6 +1101,18 @@ def export(
     console.print(f"[green]Exported![/green] ({fmt.upper()})")
     console.print(f"  Entities: {kg.entity_count}")
     console.print(f"  Relations: {kg.relation_count}")
+
+    export_data = kg.export()
+    auto_approve_stats = export_data.get("metadata", {}).get("auto_approve_stats", {})
+    if auto_approve_stats and auto_approve_stats.get("total_auto_approved", 0) > 0:
+        total_auto = auto_approve_stats.get("total_auto_approved", 0)
+        last_ratio = auto_approve_stats.get("last_run_auto_approve_ratio", 0)
+        threshold = auto_approve_stats.get("threshold", "N/A")
+        console.print(
+            f"  Auto-Approved: {total_auto} total "
+            f"(last run: {last_ratio:.1%} @ threshold {threshold})"
+        )
+
     if fmt.lower() == "csv":
         console.print(f"  Output: {result}/entities.csv, {result}/relations.csv")
     else:
@@ -894,6 +1206,18 @@ def view(
     console.print("[green]View generated![/green]")
     console.print(f"  Entities: {entity_ct}")
     console.print(f"  Relations: {relation_ct}")
+
+    export_data = kg.export()
+    auto_approve_stats = export_data.get("metadata", {}).get("auto_approve_stats", {})
+    if auto_approve_stats and auto_approve_stats.get("total_auto_approved", 0) > 0:
+        total_auto = auto_approve_stats.get("total_auto_approved", 0)
+        last_ratio = auto_approve_stats.get("last_run_auto_approve_ratio", 0)
+        threshold = auto_approve_stats.get("threshold", "N/A")
+        console.print(
+            f"  Auto-Approved: {total_auto} total "
+            f"(last run: {last_ratio:.1%} @ threshold {threshold})"
+        )
+
     console.print(f"  Output: {result}")
     if no_open:
         console.print(f"  Open in browser: [cyan]file://{result.resolve()}[/cyan]")
@@ -1007,6 +1331,18 @@ def narrate(
     console.print("[green]Narrative generated![/green]")
     console.print(f"  Output: {narrative_path}")
     console.print(f"  Cost: ${llm.total_cost_usd:.4f}")
+
+    export_data = kg.export()
+    auto_approve_stats = export_data.get("metadata", {}).get("auto_approve_stats", {})
+    if auto_approve_stats and auto_approve_stats.get("total_auto_approved", 0) > 0:
+        total_auto = auto_approve_stats.get("total_auto_approved", 0)
+        last_ratio = auto_approve_stats.get("last_run_auto_approve_ratio", 0)
+        threshold = auto_approve_stats.get("threshold", "N/A")
+        console.print(
+            f"  Auto-Approved: {total_auto} total "
+            f"(last run: {last_ratio:.1%} @ threshold {threshold})"
+        )
+
     console.print()
     console.print("Pipeline complete! Review the narrative at:")
     console.print(f"  [cyan]{narrative_path}[/cyan]")
@@ -1052,12 +1388,16 @@ SIFT_DEFAULT_MODEL=openai/gpt-4o-mini
             project_config += "# domain: path/to/domain.yaml\n"
         project_config += "# model: openai/gpt-4o-mini\n"
         project_config += "# output: output\n"
+        project_config += "schema_version: v1\n"
+        project_config += "snapshot_retention: 50\n"
         project_config += "\n# extraction:\n"
         project_config += (
             "#   backend: kreuzberg      # kreuzberg (default, 75+ formats) | pdfplumber\n"
         )
         project_config += "#   ocr_backend: tesseract   # tesseract | easyocr | paddleocr | gcv\n"
         project_config += "#   ocr_language: eng\n"
+        project_config += "\n# resolve:\n"
+        project_config += "#   auto_approve_threshold: 0.9  # Auto-merge proposals with confidence >= this\n"
         sift_yaml_path.write_text(project_config)
         console.print("[green]Created sift.yaml[/green]")
 
@@ -1112,6 +1452,11 @@ def info(
             data["entities"] = clean.entity_count
             data["relations"] = clean.relation_count
 
+            export_data = kg.export()
+            auto_approve_stats = export_data.get("metadata", {}).get("auto_approve_stats", {})
+            if auto_approve_stats:
+                data["auto_approve_stats"] = auto_approve_stats
+
         proposals_path = output_dir / "merge_proposals.yaml"
         if proposals_path.exists():
             from sift_kg.resolve.io import read_proposals
@@ -1162,6 +1507,18 @@ def info(
 
         kg = KnowledgeGraph.load(graph_path)
         table.add_row("Graph", f"{kg.entity_count} entities, {kg.relation_count} relations")
+
+        export_data = kg.export()
+        auto_approve_stats = export_data.get("metadata", {}).get("auto_approve_stats", {})
+        if auto_approve_stats:
+            total_auto = auto_approve_stats.get("total_auto_approved", 0)
+            last_ratio = auto_approve_stats.get("last_run_auto_approve_ratio", 0)
+            threshold = auto_approve_stats.get("threshold", "N/A")
+            if total_auto > 0:
+                table.add_row(
+                    "Auto-Approved Merges",
+                    f"{total_auto} total (last run: {last_ratio:.1%} @ threshold {threshold})"
+                )
     else:
         table.add_row("Graph", "Not built")
 

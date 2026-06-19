@@ -10,6 +10,7 @@ Uses async concurrency to process type batches in parallel.
 import asyncio
 import json
 import logging
+from pathlib import Path
 
 from unidecode import unidecode
 
@@ -490,3 +491,62 @@ OUTPUT JSON:"""
         ))
 
     return proposals, variant_relations
+
+
+def apply_auto_approve(
+    merge_file: MergeFile,
+    threshold: float,
+    output_dir: Path,
+) -> tuple[MergeFile, MergeFile, int]:
+    """Auto-approve merge proposals with confidence >= threshold.
+
+    Args:
+        merge_file: MergeFile with DRAFT proposals
+        threshold: Minimum confidence for auto-approval (0.0-1.0)
+        output_dir: Output directory for merges_pending.json
+
+    Returns:
+        Tuple of (updated_merge_file, pending_file, auto_approved_count)
+        - updated_merge_file: MergeFile with high-confidence proposals marked CONFIRMED
+        - pending_file: MergeFile with low-confidence proposals for review
+        - auto_approved_count: Number of proposals auto-approved
+    """
+    import json as json_mod
+
+    auto_approved = []
+    pending = []
+
+    for proposal in merge_file.proposals:
+        if not proposal.members:
+            continue
+
+        avg_confidence = sum(m.confidence for m in proposal.members) / len(proposal.members)
+
+        if avg_confidence >= threshold:
+            proposal.status = "CONFIRMED"
+            auto_approved.append(proposal)
+            logger.info(
+                f"Auto-approved merge: {proposal.canonical_name} "
+                f"(avg confidence: {avg_confidence:.3f} >= {threshold:.3f})"
+            )
+        else:
+            pending.append(proposal.model_copy(deep=True))
+            logger.info(
+                f"Pending review: {proposal.canonical_name} "
+                f"(avg confidence: {avg_confidence:.3f} < {threshold:.3f})"
+            )
+
+    pending_file = MergeFile(proposals=pending)
+
+    pending_path = output_dir / "merges_pending.json"
+    if pending:
+        pending_path.write_text(
+            json_mod.dumps(pending_file.model_dump(), indent=2, default=str),
+            encoding="utf-8",
+        )
+        logger.info(f"Wrote {len(pending)} pending proposals to {pending_path}")
+    elif pending_path.exists():
+        pending_path.unlink()
+        logger.info("No pending proposals, removed merges_pending.json")
+
+    return merge_file, pending_file, len(auto_approved)

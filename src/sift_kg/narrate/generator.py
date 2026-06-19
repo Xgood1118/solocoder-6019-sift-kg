@@ -98,8 +98,19 @@ def generate_narrative(
     include_entity_descriptions: bool = True,
     max_cost: float | None = None,
     concurrency: int = DEFAULT_CONCURRENCY,
+    replay_mode: bool = False,
 ) -> Path:
     """Generate narrative markdown from knowledge graph.
+
+    Args:
+        kg: KnowledgeGraph instance
+        llm: LLMClient for generation
+        output_dir: Output directory path
+        system_context: Domain context for narrative generation
+        include_entity_descriptions: Whether to generate per-entity descriptions
+        max_cost: Maximum cost budget in USD
+        concurrency: Concurrent LLM calls
+        replay_mode: If True, indicates this is a snapshot replay (no re-extraction)
 
     Returns:
         Path to written narrative.md

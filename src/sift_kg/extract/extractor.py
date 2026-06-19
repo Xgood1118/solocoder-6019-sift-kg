@@ -111,23 +111,45 @@ async def _aextract_from_text(
 
     # Schema discovery for schema-free domains
     if domain.schema_free and output_dir is not None:
+        from sift_kg.config import SiftConfig
         from sift_kg.domains.discovery import (
             discover_domain,
             load_discovered_domain,
             save_discovered_domain,
         )
+        from sift_kg.domains.incremental import (
+            check_schema_version,
+            save_schema_metadata,
+        )
 
         discovered_path = output_dir / "discovered_domain.yaml"
-        cached = load_discovered_domain(discovered_path)
-        if cached is not None and not force:
-            logger.info(f"Using cached discovered schema ({len(cached.entity_types)} entity types)")
-            domain = cached
-        else:
+        yaml_info = SiftConfig.get_project_yaml_info()
+
+        if not force:
+            version_check = check_schema_version(output_dir)
+            if version_check.is_match and discovered_path.exists():
+                cached = load_discovered_domain(discovered_path)
+                if cached is not None:
+                    logger.info(
+                        f"Schema version match ({version_check.message}), "
+                        f"reusing cached schema ({len(cached.entity_types)} entity types)"
+                    )
+                    domain = cached
+
+        if domain.schema_free:
             samples = [chunks[0].text[:3000]]
             try:
                 domain = await discover_domain(samples, llm, domain.system_context or "")
                 save_discovered_domain(domain, discovered_path)
-                logger.info(f"Discovered schema: {len(domain.entity_types)} entity types, {len(domain.relation_types)} relation types")
+                save_schema_metadata(
+                    output_dir,
+                    yaml_info["schema_version"],
+                    yaml_info["file_size"],
+                )
+                logger.info(
+                    f"Discovered schema: {len(domain.entity_types)} entity types, "
+                    f"{len(domain.relation_types)} relation types"
+                )
             except (RuntimeError, ValueError) as e:
                 logger.warning(f"Schema discovery failed, falling back to schema-free extraction: {e}")
 
