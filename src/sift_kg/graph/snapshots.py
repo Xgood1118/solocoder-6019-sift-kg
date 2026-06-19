@@ -85,10 +85,11 @@ def create_snapshot(
     """
     from sift_kg.config import SiftConfig
 
-    config = SiftConfig()
-    effective_retention = retention_count
-    if config.snapshot_retention:
-        effective_retention = config.snapshot_retention
+    try:
+        config = SiftConfig()
+        effective_retention = config.snapshot_retention or retention_count
+    except Exception:
+        effective_retention = retention_count
 
     snapshot_dir = _get_snapshot_dir(output_dir)
     snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -195,14 +196,24 @@ def find_snapshot_by_name(output_dir: Path, name: str) -> Path | None:
 class SnapshotDiff:
     """Represents the difference between two snapshots."""
 
-    def __init__(self, snapshot_a: Path, snapshot_b: Path):
-        self.snapshot_a = snapshot_a
-        self.snapshot_b = snapshot_b
-        self.data_a = load_snapshot(snapshot_a)
-        self.data_b = load_snapshot(snapshot_b)
+    def __init__(self, snapshot_a: "dict[str, Any] | Path", snapshot_b: "dict[str, Any] | Path"):
+        if isinstance(snapshot_a, dict):
+            self.data_a = snapshot_a
+            self.snapshot_a = None
+        else:
+            self.snapshot_a = snapshot_a
+            self.data_a = load_snapshot(snapshot_a)
+            if self.data_a is None:
+                raise ValueError(f"Failed to load snapshot: {snapshot_a}")
 
-        if self.data_a is None or self.data_b is None:
-            raise ValueError("Failed to load one or both snapshots")
+        if isinstance(snapshot_b, dict):
+            self.data_b = snapshot_b
+            self.snapshot_b = None
+        else:
+            self.snapshot_b = snapshot_b
+            self.data_b = load_snapshot(snapshot_b)
+            if self.data_b is None:
+                raise ValueError(f"Failed to load snapshot: {snapshot_b}")
 
         self.nodes_a = {n["id"]: n for n in self.data_a.get("nodes", [])}
         self.nodes_b = {n["id"]: n for n in self.data_b.get("nodes", [])}
@@ -273,11 +284,17 @@ class SnapshotDiff:
 
     def to_markdown(self) -> str:
         """Generate markdown report of the diff."""
-        ts_a = _parse_snapshot_timestamp(self.snapshot_a.name)
-        ts_b = _parse_snapshot_timestamp(self.snapshot_b.name)
+        if self.snapshot_a is not None:
+            ts_a = _parse_snapshot_timestamp(self.snapshot_a.name)
+            ts_a_str = ts_a.isoformat() if ts_a else self.snapshot_a.name
+        else:
+            ts_a_str = self.data_a.get("snapshot_timestamp", "unknown")
 
-        ts_a_str = ts_a.isoformat() if ts_a else self.snapshot_a.name
-        ts_b_str = ts_b.isoformat() if ts_b else self.snapshot_b.name
+        if self.snapshot_b is not None:
+            ts_b = _parse_snapshot_timestamp(self.snapshot_b.name)
+            ts_b_str = ts_b.isoformat() if ts_b else self.snapshot_b.name
+        else:
+            ts_b_str = self.data_b.get("snapshot_timestamp", "unknown")
 
         lines = []
         lines.append(f"# Graph Snapshot Diff")
@@ -475,9 +492,13 @@ def replay_snapshot(
         f"{kg.relation_count} relations"
     )
 
-    from sift_kg.cli import _load_domain
+    from sift_kg.domains.loader import DomainLoader
 
-    domain_config = _load_domain(config, domain_name)
+    loader = DomainLoader()
+    if config.domain_path and config.domain_path.exists():
+        domain_config = loader.load_from_path(config.domain_path)
+    else:
+        domain_config = loader.load_bundled(domain_name)
     system_context = domain_config.system_context or ""
 
     llm = LLMClient(model=effective_model)

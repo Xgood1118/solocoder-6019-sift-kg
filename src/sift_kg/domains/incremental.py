@@ -194,7 +194,7 @@ def merge_discovered_schemas(
         entity_types=merged_entity_types,
         relation_types=merged_relation_types,
         fallback_relation=existing.fallback_relation,
-        schema_free=False,
+        schema_free=existing.schema_free,
         system_context=existing.system_context or new.system_context,
     )
 

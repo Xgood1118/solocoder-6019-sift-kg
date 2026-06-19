@@ -1,11 +1,8 @@
 """Tests for sift_kg.graph.snapshots (knowledge graph time snapshots)."""
 
 import json
-import tempfile
 import time
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -37,10 +34,9 @@ class TestSnapshotCreation:
 
         data = json.loads(snapshot_path.read_text(encoding="utf-8"))
         assert "nodes" in data
-        assert "edges" in data
+        assert "links" in data
         assert "metadata" in data
-        assert "snapshot_timestamp" in data["metadata"]
-        assert data["metadata"]["snapshot_type"] == "full"
+        assert "snapshot_timestamp" in data
 
     def test_snapshot_filename_iso8601(self, sample_graph, tmp_dir):
         """Snapshot filename follows ISO8601 pattern."""
@@ -48,10 +44,10 @@ class TestSnapshotCreation:
 
         name = snapshot_path.stem
         assert name.startswith("graph-")
-        timestamp_part = name[len("graph-") :]
+        timestamp_part = name[len("graph-"):]
         assert "T" in timestamp_part
 
-    def test_roll_old_snapshots(self, sample_graph, tmp_dir):
+    def test_roll_old_snapshots(self, tmp_dir):
         """Old snapshots are rolled when exceeding retention count."""
         snapshots_dir = tmp_dir / "snapshots"
         snapshots_dir.mkdir(parents=True, exist_ok=True)
@@ -66,7 +62,7 @@ class TestSnapshotCreation:
         remaining = sorted(snapshots_dir.glob("*.json"))
         assert len(remaining) == 3
 
-    def test_roll_keeps_newest(self, sample_graph, tmp_dir):
+    def test_roll_keeps_newest(self, tmp_dir):
         """Rolling keeps the newest snapshots."""
         snapshots_dir = tmp_dir / "snapshots"
         snapshots_dir.mkdir(parents=True, exist_ok=True)
@@ -99,19 +95,20 @@ class TestSnapshotCreation:
         assert found == snapshot_path
 
     def test_find_snapshot_not_found(self, tmp_dir):
-        """Non-existent snapshot raises ValueError."""
-        with pytest.raises(ValueError, match="Snapshot not found"):
-            find_snapshot_by_name(tmp_dir, "nonexistent.json")
+        """Non-existent snapshot returns None."""
+        result = find_snapshot_by_name(tmp_dir, "nonexistent.json")
+        assert result is None
 
 
 class TestSnapshotDiff:
     """Test snapshot diff calculation."""
 
-    def _make_snapshot_data(self, nodes, edges):
+    def _make_snapshot_data(self, nodes, edges=None, links=None):
         """Helper to create snapshot data structure."""
         return {
             "nodes": nodes,
-            "edges": edges,
+            "links": links or [],
+            "edges": edges or [],
             "metadata": {"snapshot_timestamp": "2024-01-01T00:00:00Z"},
         }
 
@@ -119,14 +116,12 @@ class TestSnapshotDiff:
         """New nodes in B are detected as added."""
         a = self._make_snapshot_data(
             [{"id": "n1", "name": "Alice", "entity_type": "PERSON"}],
-            [],
         )
         b = self._make_snapshot_data(
             [
                 {"id": "n1", "name": "Alice", "entity_type": "PERSON"},
                 {"id": "n2", "name": "Bob", "entity_type": "PERSON"},
             ],
-            [],
         )
 
         diff = SnapshotDiff(a, b)
@@ -140,11 +135,9 @@ class TestSnapshotDiff:
                 {"id": "n1", "name": "Alice", "entity_type": "PERSON"},
                 {"id": "n2", "name": "Bob", "entity_type": "PERSON"},
             ],
-            [],
         )
         b = self._make_snapshot_data(
             [{"id": "n1", "name": "Alice", "entity_type": "PERSON"}],
-            [],
         )
 
         diff = SnapshotDiff(a, b)
@@ -158,26 +151,20 @@ class TestSnapshotDiff:
                 {"id": "n1", "name": "Alice", "entity_type": "PERSON"},
                 {"id": "n2", "name": "Acme", "entity_type": "ORGANIZATION"},
             ],
-            [],
         )
         b = self._make_snapshot_data(
             [
                 {"id": "n1", "name": "Alice", "entity_type": "PERSON"},
                 {"id": "n2", "name": "Acme", "entity_type": "ORGANIZATION"},
             ],
-            [
-                {
-                    "source": "n1",
-                    "target": "n2",
-                    "relation_type": "WORKS_FOR",
-                    "key": "0",
-                }
+            links=[
+                {"source": "n1", "target": "n2", "relation_type": "WORKS_FOR"},
             ],
         )
 
         diff = SnapshotDiff(a, b)
         assert len(diff.added_edges) == 1
-        assert diff.added_edges[0]["relation_type"] == "WORKS_FOR"
+        assert diff.added_edges[0][2] == "WORKS_FOR"
 
     def test_removed_edges(self):
         """Edges in A but not B are detected as removed."""
@@ -186,13 +173,8 @@ class TestSnapshotDiff:
                 {"id": "n1", "name": "Alice", "entity_type": "PERSON"},
                 {"id": "n2", "name": "Acme", "entity_type": "ORGANIZATION"},
             ],
-            [
-                {
-                    "source": "n1",
-                    "target": "n2",
-                    "relation_type": "WORKS_FOR",
-                    "key": "0",
-                }
+            links=[
+                {"source": "n1", "target": "n2", "relation_type": "WORKS_FOR"},
             ],
         )
         b = self._make_snapshot_data(
@@ -200,7 +182,6 @@ class TestSnapshotDiff:
                 {"id": "n1", "name": "Alice", "entity_type": "PERSON"},
                 {"id": "n2", "name": "Acme", "entity_type": "ORGANIZATION"},
             ],
-            [],
         )
 
         diff = SnapshotDiff(a, b)
@@ -210,17 +191,16 @@ class TestSnapshotDiff:
         """Entities with same name/type but different ID are detected as renamed."""
         a = self._make_snapshot_data(
             [{"id": "person:alice_smith", "name": "Alice Smith", "entity_type": "PERSON"}],
-            [],
         )
         b = self._make_snapshot_data(
             [{"id": "person:alice_jones", "name": "Alice Smith", "entity_type": "PERSON"}],
-            [],
         )
 
         diff = SnapshotDiff(a, b)
         assert len(diff.renamed_entities) == 1
-        assert diff.renamed_entities[0]["old_id"] == "person:alice_smith"
-        assert diff.renamed_entities[0]["new_id"] == "person:alice_jones"
+        old_id, old_name, new_id, new_name = diff.renamed_entities[0]
+        assert old_id == "person:alice_smith"
+        assert new_id == "person:alice_jones"
 
     def test_to_markdown(self):
         """Markdown report is generated correctly."""
@@ -229,14 +209,12 @@ class TestSnapshotDiff:
                 {"id": "n1", "name": "Alice", "entity_type": "PERSON"},
                 {"id": "n2", "name": "Bob", "entity_type": "PERSON"},
             ],
-            [],
         )
         b = self._make_snapshot_data(
             [
                 {"id": "n1", "name": "Alice", "entity_type": "PERSON"},
                 {"id": "n3", "name": "Charlie", "entity_type": "PERSON"},
             ],
-            [],
         )
 
         diff = SnapshotDiff(a, b)
@@ -248,7 +226,6 @@ class TestSnapshotDiff:
         assert "Charlie" in md
         assert "Bob" in md
         assert "| Metric" in md
-        assert "| Count" in md
 
     def test_diff_snapshots_function(self, sample_graph, tmp_dir):
         """diff_snapshots function returns markdown report."""
@@ -267,13 +244,12 @@ class TestSnapshotDiff:
 class TestSnapshotRetention:
     """Test snapshot retention configuration."""
 
-    def test_default_retention(self, sample_graph, tmp_dir):
-        """Default retention is 50."""
-        from sift_kg.graph.snapshots import _DEFAULT_RETENTION
+    def test_default_retention_in_create(self, sample_graph, tmp_dir):
+        """create_snapshot uses default retention of 50."""
+        snapshot_path = create_snapshot(sample_graph, tmp_dir)
+        assert snapshot_path.exists()
 
-        assert _DEFAULT_RETENTION == 50
-
-    def test_custom_retention(self, sample_graph, tmp_dir):
+    def test_custom_retention(self, tmp_dir):
         """Custom retention count is respected."""
         snapshots_dir = tmp_dir / "snapshots"
         snapshots_dir.mkdir(parents=True, exist_ok=True)

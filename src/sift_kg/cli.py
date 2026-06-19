@@ -23,10 +23,15 @@ console = Console()
 @app.callback()
 def global_options(
     ctx: typer.Context,
-    diff_snapshots: tuple[str, str] | None = typer.Option(
+    diff_snapshot_a: str | None = typer.Option(
         None,
         "--diff-snapshots",
-        help="Compute diff between two snapshots (A B). Outputs markdown to stdout.",
+        help="First snapshot for diff (use with --diff-snapshot-b).",
+    ),
+    diff_snapshot_b: str | None = typer.Option(
+        None,
+        "--diff-snapshot-b",
+        help="Second snapshot for diff.",
     ),
     replay_snapshot: str | None = typer.Option(
         None,
@@ -38,14 +43,14 @@ def global_options(
     ),
 ) -> None:
     """Global options for sift CLI."""
-    if diff_snapshots is not None:
+    if diff_snapshot_a is not None and diff_snapshot_b is not None:
         config = SiftConfig()
         output_dir = Path(output) if output else config.output_dir
 
         from sift_kg.graph.snapshots import diff_snapshots
 
         try:
-            report = diff_snapshots(output_dir, diff_snapshots[0], diff_snapshots[1])
+            report = diff_snapshots(output_dir, diff_snapshot_a, diff_snapshot_b)
             print(report)
             raise typer.Exit(0)
         except ValueError as e:
@@ -56,11 +61,11 @@ def global_options(
         config = SiftConfig()
         output_dir = Path(output) if output else config.output_dir
 
-        from sift_kg.graph.snapshots import replay_snapshot
+        from sift_kg.graph.snapshots import replay_snapshot as _replay_snapshot
 
         try:
-            narrative_path = replay_snapshot(output_dir, replay_snapshot)
-            console.print(f"[green]Snapshot replay complete![/green]")
+            narrative_path = _replay_snapshot(output_dir, replay_snapshot)
+            console.print("[green]Snapshot replay complete![/green]")
             console.print(f"  Narrative: {narrative_path}")
             raise typer.Exit(0)
         except ValueError as e:
@@ -190,6 +195,7 @@ def extract(
     docs_to_extract = docs
     incremental_skip_discovery = False
     incremental_merge_mode = False
+    cached = None
 
     if domain_config.schema_free and not force:
         from sift_kg.config import SiftConfig
@@ -241,7 +247,12 @@ def extract(
                     "  [red]No[/red]: Keep existing schema, new documents go to unassigned bucket"
                 )
 
-                if typer.confirm("Re-run schema discovery?", default=True):
+                try:
+                    do_rediscover = typer.confirm("Re-run schema discovery?", default=True)
+                except (SystemExit, KeyboardInterrupt):
+                    do_rediscover = False
+
+                if do_rediscover:
                     incremental_merge_mode = True
                     console.print()
                     console.print(

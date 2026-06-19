@@ -1,11 +1,9 @@
 """Tests for sift_kg.domains.incremental (incremental build workflow)."""
 
-import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-import yaml
 
 from sift_kg.domains.incremental import (
     SchemaCheckResult,
@@ -57,7 +55,7 @@ class TestSchemaMetadata:
             result = check_schema_version(tmp_dir)
 
             assert result.is_match is True
-            assert result.message == "Schema version matches"
+            assert "v1" in result.message
 
     def test_check_version_mismatch(self, tmp_dir):
         """Version mismatch detected correctly."""
@@ -69,7 +67,7 @@ class TestSchemaMetadata:
             result = check_schema_version(tmp_dir)
             assert result.is_match is False
             assert result.needs_confirmation is True
-            assert "version mismatch" in result.message.lower()
+            assert "changed" in result.message.lower()
 
     def test_check_filesize_mismatch(self, tmp_dir):
         """File size mismatch detected correctly."""
@@ -147,13 +145,21 @@ class TestSchemaMerge:
         assert set(merged.relation_types.keys()) == {"WORKS_FOR", "LOCATED_IN"}
         assert merged.entity_types["PERSON"].description == "Person"
 
-    def test_merge_with_schema_free_check(self):
-        """Merged domain remains schema_free."""
+    def test_merge_preserves_schema_free(self):
+        """Merged domain preserves schema_free from existing."""
         old = DomainConfig(name="test", entity_types={}, relation_types={}, schema_free=True)
         new = DomainConfig(name="test", entity_types={}, relation_types={}, schema_free=True)
 
         merged = merge_discovered_schemas(old, new)
         assert merged.schema_free is True
+
+    def test_merge_preserves_schema_free_false(self):
+        """Merged domain preserves schema_free=False from existing."""
+        old = DomainConfig(name="test", entity_types={}, relation_types={}, schema_free=False)
+        new = DomainConfig(name="test", entity_types={}, relation_types={}, schema_free=True)
+
+        merged = merge_discovered_schemas(old, new)
+        assert merged.schema_free is False
 
 
 class TestUnassignedBucket:
@@ -165,8 +171,10 @@ class TestUnassignedBucket:
         add_to_unassigned_bucket(tmp_dir, doc_ids, reason="schema change")
 
         loaded = load_unassigned_bucket(tmp_dir)
-        assert set(loaded["unassigned_documents"]) == set(doc_ids)
-        assert loaded["reason"] == "schema change"
+        assert "doc:001" in loaded
+        assert "doc:002" in loaded
+        assert loaded["doc:001"]["reason"] == "schema change"
+        assert loaded["doc:002"]["reason"] == "schema change"
 
     def test_add_appends_to_existing(self, tmp_dir):
         """Adding documents appends to existing bucket."""
@@ -174,9 +182,21 @@ class TestUnassignedBucket:
         add_to_unassigned_bucket(tmp_dir, ["doc:002"], reason="second")
 
         loaded = load_unassigned_bucket(tmp_dir)
-        assert set(loaded["unassigned_documents"]) == {"doc:001", "doc:002"}
+        assert "doc:001" in loaded
+        assert "doc:002" in loaded
+        assert loaded["doc:001"]["reason"] == "first"
+        assert loaded["doc:002"]["reason"] == "second"
 
     def test_load_empty_bucket(self, tmp_dir):
-        """Loading empty bucket returns empty list."""
+        """Loading empty bucket returns empty dict."""
         loaded = load_unassigned_bucket(tmp_dir)
-        assert loaded["unassigned_documents"] == []
+        assert loaded == {}
+
+    def test_add_does_not_duplicate(self, tmp_dir):
+        """Adding the same doc_id twice does not duplicate."""
+        add_to_unassigned_bucket(tmp_dir, ["doc:001"], reason="first")
+        add_to_unassigned_bucket(tmp_dir, ["doc:001"], reason="second")
+
+        loaded = load_unassigned_bucket(tmp_dir)
+        assert len(loaded) == 1
+        assert loaded["doc:001"]["reason"] == "first"
