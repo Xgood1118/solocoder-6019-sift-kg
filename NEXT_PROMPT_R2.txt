@@ -1,0 +1,1 @@
+roll_old_snapshots 的老快照清理不对——文件名里日期数字位数不固定（比如 010 表示第 10 天）时，strptime 把 010 解析成第 1 天，排序就乱掉，该删的没删、不该删的反倒被删了。另外 resolver.py 那行 import logging 没用到会飘警告。检查修复一下。
