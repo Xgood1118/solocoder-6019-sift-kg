@@ -9,6 +9,7 @@ Provides functionality for:
 
 import json
 import logging
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -34,35 +35,64 @@ def _generate_snapshot_filename() -> str:
     return f"{SNAPSHOT_PREFIX}{timestamp}.json"
 
 
+_TS_PATTERN = re.compile(
+    r"^(?P<year>\d{4})-(?P<month>\d{1,2})-(?P<day>\d{1,2})"
+    r"T(?P<hour>\d{1,2})-(?P<minute>\d{1,2})-(?P<second>\d{1,2})"
+    r"(?:-(?P<microsecond>\d{1,6}))?Z?$"
+)
+
+
 def _parse_snapshot_timestamp(filename: str) -> datetime | None:
     """Parse timestamp from snapshot filename.
 
-    Returns datetime object or None if filename format is invalid.
+    Tolerates variable digit widths (e.g. both ``01`` and ``1`` for day 1,
+    both ``010`` and ``10`` for day 10). Returns ``None`` if the filename
+    does not look like a snapshot or cannot be parsed.
     """
     if not filename.startswith(SNAPSHOT_PREFIX) or not filename.endswith(".json"):
         return None
 
     timestamp_str = filename[len(SNAPSHOT_PREFIX) : -len(".json")]
+    match = _TS_PATTERN.match(timestamp_str)
+    if match is None:
+        return None
 
     try:
-        return datetime.strptime(timestamp_str, "%Y-%m-%dT%H-%M-%S-%fZ")
-    except ValueError:
+        micro_str = match.group("microsecond") or "0"
+        microsecond = int(micro_str.ljust(6, "0"))
+        return datetime(
+            year=int(match.group("year")),
+            month=int(match.group("month")),
+            day=int(match.group("day")),
+            hour=int(match.group("hour")),
+            minute=int(match.group("minute")),
+            second=int(match.group("second")),
+            microsecond=microsecond,
+            tzinfo=UTC,
+        )
+    except (ValueError, TypeError):
         return None
 
 
 def _list_snapshots(snapshot_dir: Path) -> list[tuple[Path, datetime]]:
     """List all snapshot files with their timestamps, sorted newest first.
 
-    Returns list of (path, timestamp) tuples sorted by timestamp descending.
+    Filename timestamps are preferred; if a filename cannot be parsed the
+    file's modification time is used as a fallback so the file still takes
+    part in retention rolling.
     """
     if not snapshot_dir.exists():
         return []
 
-    snapshots = []
+    snapshots: list[tuple[Path, datetime]] = []
     for path in snapshot_dir.glob(f"{SNAPSHOT_PREFIX}*.json"):
         ts = _parse_snapshot_timestamp(path.name)
-        if ts is not None:
-            snapshots.append((path, ts))
+        if ts is None:
+            try:
+                ts = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+            except OSError:
+                continue
+        snapshots.append((path, ts))
 
     snapshots.sort(key=lambda x: x[1], reverse=True)
     return snapshots

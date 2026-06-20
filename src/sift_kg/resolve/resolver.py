@@ -511,8 +511,6 @@ def apply_auto_approve(
         - pending_file: MergeFile with low-confidence proposals for review
         - auto_approved_count: Number of proposals auto-approved
     """
-    import json as json_mod
-
     auto_approved = []
     pending = []
 
@@ -541,7 +539,7 @@ def apply_auto_approve(
     pending_path = output_dir / "merges_pending.json"
     if pending:
         pending_path.write_text(
-            json_mod.dumps(pending_file.model_dump(), indent=2, default=str),
+            json.dumps(pending_file.model_dump(), indent=2, default=str),
             encoding="utf-8",
         )
         logger.info(f"Wrote {len(pending)} pending proposals to {pending_path}")
